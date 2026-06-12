@@ -356,6 +356,19 @@ struct FIFOSchedulerConfig {
     std::string to_string() const;
 };
 
+struct GrammarConfig {
+    std::vector<int32_t> override_stop_tokens;
+
+    bool        constrained_json_disable_any_whitespace = false;
+    int         num_workers                             = 32;
+    // Byte cap on xgrammar's internal compiled-grammar cache. Set <=0 for
+    // unlimited (legacy behavior — adversarial unique-schema streams can pin
+    // GBs of compiled DFA in process memory). Default 256 MiB matches typical
+    // production schema reuse rates without throttling legitimate workloads.
+    int64_t     compiler_cache_bytes                    = 256LL * 1024 * 1024;
+    std::string tokenizer_info_json;
+};
+
 struct RuntimeConfig {
     int64_t max_generate_batch_size = 1;
 

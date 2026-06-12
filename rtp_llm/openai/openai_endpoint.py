@@ -28,6 +28,7 @@ from rtp_llm.openai.api_datatype import (
     FunctionCall,
     ModelCard,
     ModelList,
+    ResponseFormat,
     RoleEnum,
     ToolCall,
     UsageInfo,
@@ -165,6 +166,18 @@ class OpenaiEndpoint(object):
     ) -> List[List[int]]:
         return [i for i, _ in itertools.groupby(sorted(stop_words_list))]
 
+    @staticmethod
+    def _apply_response_format(rf: "ResponseFormat", config: GenerateConfig) -> None:
+        """Stage rf onto config and let GenerateConfig's projection do the work.
+
+        Shape/required-payload validation lives in ResponseFormat._check_payload
+        (pydantic). Projection to typed grammar fields + clearing of stale
+        extra_configs constraints lives in
+        GenerateConfig._project_response_format_to_grammar_fields, called from
+        validate(). This wrapper just ensures rf wins over extra_configs.
+        """
+        config.response_format = rf
+
     def _extract_generation_config(
         self, request: ChatCompletionRequest
     ) -> GenerateConfig:
@@ -236,8 +249,12 @@ class OpenaiEndpoint(object):
             and isinstance(request.extra_configs.max_thinking_tokens, int)
         ):
             config.max_thinking_tokens = request.extra_configs.max_thinking_tokens
-        # add_thinking_params now accepts generate_env_config parameter
+        # Structured output: extract grammar constraints from response_format.
+        if request.response_format is not None:
+            self._apply_response_format(request.response_format, config)
         config.add_thinking_params(self.tokenizer, self.generate_env_config)
+        if request.disable_thinking():
+            config.in_think_mode = False
         if request.debug_info:
             config.return_output_ids = True
         return config

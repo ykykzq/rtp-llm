@@ -1,8 +1,13 @@
 #pragma once
 
+#include <algorithm>
+#include <memory>
+#include <vector>
+
 #include <torch/all.h>
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/OpData.h"
+#include "rtp_llm/cpp/models/SpecLogitsProcessorTypes.h"
 #include "rtp_llm/cpp/utils/TensorDebugUtils.h"
 
 namespace rtp_llm {
@@ -63,6 +68,19 @@ public:
     mutable torch::Tensor all_probs;      // shape: [batch_size, vocab_size]
 
     std::vector<at::Generator> generator;
+
+    // MTP verify: bool dense disallow mask [batch * (propose_step + 1), vocab_size];
+    // true = disallow. defined() iff this batch is a spec-verify batch.
+    torch::Tensor                      spec_vocab_mask_gpu;
+    torch::Tensor                      spec_cap_gpu;
+    std::vector<SpecLogitsProcessorId> spec_applied_processors;
+    int                                spec_propose_step = 0;
+
+    bool hasAppliedSpecProcessor(const SpecLogitsProcessorId& id) const {
+        return id.valid()
+               && std::find(spec_applied_processors.begin(), spec_applied_processors.end(), id)
+                      != spec_applied_processors.end();
+    }
 };
 
 struct SamplerOutput {

@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 
@@ -12,9 +17,23 @@ public:
     static const float neg_inf;
 
 public:
-    virtual void  process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) = 0;
-    virtual void  updateMultiSeqStatus(const std::vector<int>& src_batch_indices)           = 0;
-    virtual void  updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens)     = 0;
+    virtual void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) = 0;
+    virtual void updateMultiSeqStatus(const std::vector<int>& src_batch_indices)           = 0;
+
+    virtual bool isStateful() const {
+        return false;
+    }
+    virtual int64_t acceptedTokenLen() const {
+        return 0;
+    }
+
+    // Engine invariant: called exactly once per token committed by GenerateStream
+    // (update / specUpdate / disagg replay). Spec/disagg paths must not bypass it.
+    // Caller already holds the GenerateStream mutex_; on error, throw
+    // LogitsProcessorException so GenerateStream::updateLogitProcessorStatus can
+    // route the failure to the owning stream via reportErrorWithoutLock.
+    virtual void updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens) = 0;
+
     void          memFill(const torch::Tensor& new_tokens_logits, size_t vocab_size, size_t index);
     void          maskLogits(torch::Tensor& new_token_logits, const torch::Tensor& vocab_mask);
     torch::Tensor generateVocabMask(size_t                                  batch_size,

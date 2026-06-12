@@ -126,25 +126,33 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
         return false;
     }
 
-    // Apply side-channel data to GenerateStream
-    // 1. First token: append to stream
-    if (payload->first_token_id > 0) {
+    // Apply side-channel data to GenerateStream. Must use updateWithoutLock:
+    // moveToNext already holds mutex_ when it reaches us via handleLoading.
+    //
+    // first_token_id presence: PrefillRpcServer::remoteGenerate always populates
+    // first_generate_token_id when a payload is produced, so reaching here with a
+    // payload means the field is set. token id 0 is a legitimate model token
+    // (BOS/PAD/byte-fallback collisions in some tokenizers) — using `> 0` as the
+    // existence guard would silently drop it. Accept any non-negative id.
+    if (payload->first_token_id >= 0) {
         stream->setIsContextStream(false);
         stream->step();
-        auto new_tokens                   = torch::zeros({(int64_t)stream->nextBatchSize(), 1}, torch::kInt32);
-        new_tokens.data_ptr<int32_t>()[0] = static_cast<int32_t>(payload->first_token_id);
         stream->incLastOutputPos();
-        stream->update({.new_tokens        = new_tokens,
-                        .num_new_tokens    = 1,
-                        .hidden_states     = {},
-                        .logits            = {},
-                        .softmax_probs     = {},
-                        .cum_log_probs     = {},
-                        .all_probs         = {},
-                        .loss              = {},
-                        .src_batch_indices = {},
-                        .all_hidden_states = {}});
-        RTP_LLM_LOG_DEBUG("applyP2PSideChannel: appended first_token_id=%ld, stream_id=%ld",
+        auto bonus_tokens                   = torch::zeros({(int64_t)stream->nextBatchSize(), 1}, torch::kInt32);
+        bonus_tokens.data_ptr<int32_t>()[0] = static_cast<int32_t>(payload->first_token_id);
+        StreamUpdateInfo bonus_info{bonus_tokens,
+                                    /*num_new_tokens=*/1,
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    torch::Tensor(),
+                                    /*update_remote_generate=*/false};
+        stream->updateWithoutLock(bonus_info);
+        RTP_LLM_LOG_DEBUG("applyP2PSideChannel: committed first_token_id=%ld via updateWithoutLock(), stream_id=%ld",
                           payload->first_token_id,
                           stream->streamId());
     }
@@ -435,7 +443,8 @@ bool StreamCacheResource::loadCacheDone() {
         return false;  // coordinator 后台线程尚未处理完
     }
     // 加载完成（无论成功失败），更新 reuse lengths
-    waitLoadCacheDone(load_cache_context_);
+    // 调用栈：GenerateStream::moveToNext (持 mutex_) → handleLoading → loadCacheDone
+    waitLoadCacheDone(load_cache_context_, /*stream_lock_held=*/true);
     if (!load_cache_context_->success()) {
         // 区分匹配失败和传输失败
         auto      read_context = std::dynamic_pointer_cast<FusedAsyncReadContext>(load_cache_context_);
@@ -604,7 +613,7 @@ void StreamCacheResource::loadCacheSync() {
     // TODO: scheduler will call incrkvblock after load cache, or may lack block on p2p connector
 }
 
-void StreamCacheResource::waitLoadCacheDone(const std::shared_ptr<AsyncContext>& load_context) {
+void StreamCacheResource::waitLoadCacheDone(const std::shared_ptr<AsyncContext>& load_context, bool stream_lock_held) {
     RTP_LLM_PROFILE_FUNCTION();
     if (!load_context) {
         return;
@@ -615,7 +624,13 @@ void StreamCacheResource::waitLoadCacheDone(const std::shared_ptr<AsyncContext>&
         RTP_LLM_LOG_WARNING(
             "load cache done but not success, stream: [%ld], error: %s", stream_->streamId(), error.ToString().c_str());
         if (error.hasError()) {
-            stream_->reportError(error.code(), error.ToString());
+            // moveToNext → handleLoading → loadCacheDone path holds mutex_; reportError
+            // would re-lock the non-recursive mutex and self-deadlock.
+            if (stream_lock_held) {
+                stream_->reportErrorWithoutLock(error.code(), error.ToString());
+            } else {
+                stream_->reportError(error.code(), error.ToString());
+            }
         }
         return;
     }

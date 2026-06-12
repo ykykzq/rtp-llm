@@ -90,6 +90,9 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
             }
         }
         RTP_LLM_LOG_DEBUG("request [%s] generate next output success", request_key.c_str());
+        if (result.value().generate_outputs.empty()) {
+            continue;
+        }
         GenerateOutputsPB outputs_pb;
 
         QueryConverter::transResponse(&outputs_pb,
@@ -116,6 +119,15 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
         }
     }
     RTP_LLM_LOG_DEBUG("request [%s] local generate done", request_key.c_str());
+
+    // The loop exits via either nextOutput() returning a non-FINISHED error (already
+    // serialized above) or via isActive()==false. The latter conflates two terminal
+    // states: clean finish vs. async-reported error (e.g. logits processor reportError
+    // arriving after the last output was consumed). Without this check, an errored
+    // stream returns gRPC OK and the client silently treats it as success.
+    if (stream->hasError()) {
+        return serializeErrorMsg(request_key, stream->statusInfo());
+    }
 
     return grpc::Status::OK;
 }
@@ -149,6 +161,14 @@ ErrorInfo LocalRpcServer::collectStreamOutput(grpc::ServerContext*              
             break;
         }
         last_outputs = output_result.value();
+    }
+    // Same race shape as pollStreamOutput: the loop exits via isFinished()==true
+    // or via FINISHED on nextOutput(), but an async-reported error (e.g. logits
+    // processor reportError arriving after the last output was consumed) could
+    // be observable only after we leave the loop. Without this check the batch
+    // path returns OkStatus and the client treats it as success.
+    if (stream->hasError()) {
+        return stream->statusInfo();
     }
     return ErrorInfo::OkStatus();
 }

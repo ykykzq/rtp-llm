@@ -66,6 +66,7 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
     model_config_(params.model_config_),
     parallelism_config(params.parallelism_config),
     runtime_config(params.runtime_config),
+    grammar_config_(params.grammar_config),
     eplb_config(params.eplb_config),
     pd_sep_config(params.pd_sep_config),
     profiling_debug_logging_config(params.profiling_debug_logging_config),
@@ -184,7 +185,8 @@ void NormalEngine::initScheduler() {
                                            parallelism_config,
                                            model_specific_config,
                                            resource_context_.cache_manager,
-                                           metrics_reporter_));
+                                           metrics_reporter_,
+                                           1));
         RTP_LLM_LOG_INFO("create fifo scheduler done");
     }
 }
