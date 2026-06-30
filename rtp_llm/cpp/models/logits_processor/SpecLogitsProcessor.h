@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "rtp_llm/cpp/models/SpecLogitsProcessorTypes.h"
+#include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
 
 namespace rtp_llm {
 
@@ -19,16 +19,19 @@ struct SpecLogitsProcessorRequest {
     size_t   vocab_size         = 0;
 };
 
-class SpecLogitsProcessor {
+class SpecLogitsProcessor: public BaseLogitsProcessor {
 public:
-    virtual ~SpecLogitsProcessor() = default;
+    ~SpecLogitsProcessor() override = default;
+
+    // Keep score-batch classification tied to the same eligibility predicate used by
+    // SpecLogitsVerifyRunner, so implementations cannot diverge from the verify path.
+    ScoreBatchRole scoreBatchRole() const final override {
+        return isSpecVerifyEligible() ? ScoreBatchRole::kSpecVerify : ScoreBatchRole::kNormalDecodeOnly;
+    }
 
     virtual bool isSpecVerifyEligible() const = 0;
 
-    // Must not mutate committed state. Returns the accept cap in
-    // [0, propose_step]. On failure, throws LogitsProcessorException carrying
-    // the GRAMMAR_* code; SpecLogitsVerifyRunner's try/catch routes it to the
-    // owning stream's error sink.
+    // Returns accept cap in [0, propose_step]; on failure stashes ErrorInfo and returns 0.
     virtual int tryAcceptAndFillBitmask(const SpecLogitsProcessorRequest& request) = 0;
 
     static size_t bitmaskWordCount(size_t vocab_size) {

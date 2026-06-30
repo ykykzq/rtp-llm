@@ -1,18 +1,21 @@
+import json
 import os
 from typing import Any, List, Optional
 from unittest import TestCase, main
 
-from pydantic import ValidationError
 from transformers import AutoTokenizer
 
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.config.response_format import ResponseFormat
 from rtp_llm.config.py_config_modules import (
     GenerateEnvConfig,
     PyMiscellaneousConfig,
     RenderConfig,
     VitConfig,
+)
+from rtp_llm.config.response_format_builder import (
+    ReasoningFormat,
+    ResponseFormatBuilder,
 )
 from rtp_llm.frontend.tokenizer_factory.tokenizers.base_tokenizer import BaseTokenizer
 from rtp_llm.frontend.tokenizer_factory.tokenizers.tokenization_qwen import (
@@ -509,191 +512,224 @@ class OpenaiGenerateConfigTest(TestCase):
 
 
 class GrammarBeamSearchRejectionTest(TestCase):
-    """validate() must reject beam search + grammar-constrained decoding."""
+    """ResponseFormatBuilder must reject beam search + grammar-constrained decoding."""
 
-    def _assert_rejected(self, **fields):
+    def _apply(self, **fields):
+        cfg = GenerateConfig(**fields)
+        cfg.validate()
+        ResponseFormatBuilder(cfg).apply()
+        return cfg
+
+    def _assert_rejected(self, exception_type: ExceptionType, **fields):
         cfg = GenerateConfig(**fields)
         with self.assertRaises(FtRuntimeException) as ctx:
             cfg.validate()
-        self.assertEqual(
-            ctx.exception.exception_type, ExceptionType.UNSUPPORTED_OPERATION
-        )
-
-    def _assert_accepted(self, **fields):
-        GenerateConfig(**fields).validate()
+            ResponseFormatBuilder(cfg).apply()
+        self.assertEqual(ctx.exception.exception_type, exception_type)
 
     def test_grammar_field_plus_beam_rejected(self):
-        # Each direct grammar field (incl. empty/falsy values that earlier
-        # truthy-checks let through) plus any beam-search-shaped knob.
-        grammar_fields = [
-            ("json_schema", '{"type": "object"}'),
-            ("json_schema", {}),
-            ("json_schema", ""),
-            ("regex", r"\d+"),
-            ("regex", ""),
-            ("ebnf", "root ::= 'a'"),
-            ("ebnf", ""),
-            ("structural_tag", '{"begin": "<t>", "end": "</t>"}'),
-            ("structural_tag", ""),
-        ]
-        beam_knobs = [
-            {"num_beams": 4},
-            {"variable_num_beams": [1, 3]},
-            {"num_return_sequences": 2},
-        ]
-        for grammar_key, grammar_val in grammar_fields:
-            for beam in beam_knobs:
-                with self.subTest(grammar=grammar_key, value=grammar_val, beam=beam):
-                    self._assert_rejected(**{grammar_key: grammar_val}, **beam)
-
-    def test_response_format_plus_beam_rejected(self):
-        # Every response_format type that resolves to a grammar must reject;
-        # plain string and dict envelopes both flow through.
-        formats = [
-            {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
-            {"type": "json_object"},
-            {"type": "regex", "pattern": r"\d+"},
-            '{"type": "json_object"}',
-        ]
-        for rf in formats:
-            with self.subTest(response_format=rf):
-                self._assert_rejected(num_beams=2, response_format=rf)
-
-    def test_response_format_no_grammar_allowed(self):
-        # `text` and empty envelopes do not set a grammar, so beam stays allowed.
-        for rf in [{"type": "text"}, {}, "", None]:
-            with self.subTest(response_format=rf):
-                self._assert_accepted(num_beams=2, response_format=rf)
-
-    def test_response_format_unknown_type_rejected(self):
-        # `type` is a closed Literal; pydantic rejects at construction time.
-        with self.assertRaises(ValidationError):
-            GenerateConfig(response_format={"type": "something_else"})
-
-    def test_response_format_missing_payload_rejected(self):
-        # Envelope names a grammar type but the corresponding inner payload is
-        # missing/empty/wrong-typed: pydantic ResponseFormat rejects before
-        # GenerateConfig validate runs, so the caller fails fast at parse time
-        # instead of running unconstrained.
         cases = [
-            {"type": "json_schema"},  # no inner
-            {"type": "json_schema", "json_schema": {}},  # missing schema
+            {"json_schema": '{"type": "object"}', "num_beams": 4},
             {
-                "type": "json_schema",
-                "json_schema": {"name": "foo"},
-            },  # the silent-relax case
-            {"type": "json_schema", "json_schema": 42},  # wrong inner type
-            {"type": "json_schema", "json_schema": [1, 2]},  # wrong inner type
-            {"type": "regex"},
-            {"type": "regex", "pattern": ""},
-            {"type": "regex", "pattern": {"foo": "bar"}},  # wrong pattern type
-            {"type": "ebnf"},
-            {"type": "ebnf", "grammar": ""},
-            {"type": "structural_tag"},
-            {"type": "structural_tag", "structural_tag": ""},
+                "response_format": {"type": "regex", "pattern": r"\d+"},
+                "variable_num_beams": [1, 3],
+            },
+            {
+                "response_format": '{"type":"json_object"}',
+                "num_return_sequences": 2,
+            },
         ]
-        for rf in cases:
-            with self.subTest(response_format=rf):
-                with self.assertRaises(ValidationError):
-                    GenerateConfig(response_format=rf)
-
-    def test_response_format_json_object_no_payload_required(self):
-        # `json_object` is the any-JSON shortcut and intentionally has no inner payload.
-        self._assert_accepted(num_beams=1, response_format={"type": "json_object"})
+        for fields in cases:
+            with self.subTest(fields=fields):
+                self._assert_rejected(ExceptionType.UNSUPPORTED_OPERATION, **fields)
 
     def test_grammar_or_beam_alone_allowed(self):
-        # Sanity: each side in isolation must validate.
-        self._assert_accepted(json_schema='{"type": "object"}')
-        self._assert_accepted(num_beams=4)
-        self._assert_accepted(
-            num_beams=4, json_schema=None, regex=None, ebnf=None, structural_tag=None
-        )
+        for fields in [
+            {"json_schema": '{"type": "object"}'},
+            {"num_beams": 4},
+            {"num_beams": 4, "response_format": {"type": "text"}},
+        ]:
+            with self.subTest(fields=fields):
+                self._apply(**fields)
+
+    def test_empty_direct_grammar_field_rejected(self):
+        self._assert_rejected(ExceptionType.ERROR_INPUT_FORMAT_ERROR, regex="")
 
 
 class ResponseFormatProjectionTest(TestCase):
-    """response_format is projected to typed grammar fields and cleared.
+    """rf projected to typed fields and cleared by ResponseFormatBuilder."""
 
-    After validate(), C++ never sees the envelope — only the typed fields.
-    The top-level rf wins over any stale extra_configs grammar.
-    """
+    def _terminate_without_stop_token(self, cfg: GenerateConfig) -> bool:
+        return ResponseFormatBuilder.grammar_terminate_without_stop_token(cfg)
 
-    def test_json_schema_envelope_projected(self):
-        cfg = GenerateConfig(
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"schema": {"type": "string"}},
-            }
+    def _validate(
+        self,
+        cfg: GenerateConfig,
+        reasoning_format: Optional[ReasoningFormat] = None,
+    ):
+        cfg.validate()
+        ResponseFormatBuilder(cfg, reasoning_format=reasoning_format).apply()
+
+    def _enable_thinking(
+        self,
+        cfg: GenerateConfig,
+        think_end_tag: str = "</think>\n\n",
+        think_end_token_id: int = -1,
+    ):
+        generate_env_config = GenerateEnvConfig()
+        generate_env_config.think_mode = 1
+        generate_env_config.think_end_token_id = think_end_token_id
+        generate_env_config.think_end_tag = think_end_tag
+        cfg.add_thinking_params(
+            None,
+            generate_env_config,
+            normalize_response_format=False,
         )
-        cfg.validate()
-        self.assertIsNone(cfg.response_format)
-        self.assertEqual(cfg.json_schema, '{"type":"string"}')
-        self.assertIsNone(cfg.regex)
-        self.assertIsNone(cfg.ebnf)
-        self.assertIsNone(cfg.structural_tag)
+        return ReasoningFormat.from_generate_env_config(generate_env_config)
 
-    def test_json_object_envelope_projected_to_any_json(self):
-        cfg = GenerateConfig(response_format={"type": "json_object"})
-        cfg.validate()
-        self.assertIsNone(cfg.response_format)
-        self.assertEqual(cfg.json_schema, '{"type": "object"}')
+    def test_response_format_projected_to_typed_grammar_field(self):
+        cases = [
+            (
+                GenerateConfig(
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"schema": {"type": "string"}},
+                    }
+                ),
+                "json_schema",
+                '{"type":"string"}',
+                True,
+            ),
+            (
+                GenerateConfig(response_format={"type": "json_object"}),
+                "json_schema",
+                '{"type":"object"}',
+                True,
+            ),
+            (
+                GenerateConfig(response_format={"type": "regex", "pattern": r"\d+"}),
+                "regex",
+                r"\d+",
+                False,
+            ),
+            (
+                GenerateConfig(response_format='{"type":"json_object"}'),
+                "json_schema",
+                '{"type":"object"}',
+                True,
+            ),
+        ]
+        for cfg, field, expected, terminate_without_stop_token in cases:
+            with self.subTest(field=field, expected=expected):
+                self._validate(cfg)
+                self.assertIsNone(cfg.response_format)
+                self.assertEqual(getattr(cfg, field), expected)
+                self.assertEqual(
+                    self._terminate_without_stop_token(cfg),
+                    terminate_without_stop_token,
+                )
 
-    def test_regex_envelope_projected(self):
-        cfg = GenerateConfig(response_format={"type": "regex", "pattern": r"\d+"})
-        cfg.validate()
-        self.assertIsNone(cfg.response_format)
-        self.assertEqual(cfg.regex, r"\d+")
-
-    def test_text_envelope_clears_grammar(self):
+    def test_response_format_clears_or_overrides_stale_typed_field(self):
         cfg = GenerateConfig(
             response_format={"type": "text"},
             json_schema='{"type": "object"}',
         )
-        cfg.validate()
-        # rf=text wins: stale extra_configs grammar is cleared.
+        self._validate(cfg)
         self.assertIsNone(cfg.response_format)
         self.assertIsNone(cfg.json_schema)
+        self.assertFalse(self._terminate_without_stop_token(cfg))
 
-    def test_envelope_overrides_stale_typed_field(self):
-        # extra_configs.json_schema is overridden by top-level response_format.
         cfg = GenerateConfig(
             response_format={"type": "regex", "pattern": r"[a-z]+"},
             json_schema='{"type": "object"}',
         )
-        cfg.validate()
+        self._validate(cfg)
         self.assertIsNone(cfg.response_format)
         self.assertIsNone(cfg.json_schema)
         self.assertEqual(cfg.regex, r"[a-z]+")
+        self.assertFalse(self._terminate_without_stop_token(cfg))
 
-    def test_string_envelope_accepted(self):
-        cfg = GenerateConfig(response_format='{"type":"json_object"}')
-        cfg.validate()
-        self.assertIsNone(cfg.response_format)
-        self.assertEqual(cfg.json_schema, '{"type": "object"}')
+    def test_direct_grammar_dict_normalized(self):
+        cfg = GenerateConfig(json_schema={"type": "object"})
+        self._validate(cfg)
+        self.assertEqual(cfg.json_schema, '{"type":"object"}')
 
-    def test_blank_string_envelope_treated_as_none(self):
-        cfg = GenerateConfig(response_format="   ")
-        cfg.validate()
+    def test_reasoning_json_schema_wrapped_as_structural_tag(self):
+        cfg = GenerateConfig(
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+            max_thinking_tokens=64,
+        )
+        reasoning_format = self._enable_thinking(cfg)
+        self._validate(cfg, reasoning_format=reasoning_format)
+
         self.assertIsNone(cfg.response_format)
         self.assertIsNone(cfg.json_schema)
+        self.assertIsNone(cfg.regex)
+        self.assertIsNone(cfg.ebnf)
+        self.assertTrue(self._terminate_without_stop_token(cfg))
+
+        structural_tag = json.loads(cfg.structural_tag)
+        self.assertEqual(structural_tag["type"], "structural_tag")
+        elements = structural_tag["format"]["elements"]
+        self.assertEqual(elements[0]["type"], "tag")
+        self.assertEqual(elements[0]["begin"], "")
+        self.assertEqual(elements[0]["end"], "</think>\n\n")
+        self.assertEqual(elements[0]["content"], {"type": "any_text", "max_tokens": 64})
+        self.assertEqual(elements[1]["type"], "json_schema")
+        self.assertEqual(elements[1]["json_schema"], {"type": "object"})
+        self.assertEqual(elements[1]["style"], "json")
+
+    def test_reasoning_uses_token_end_when_think_end_token_id_is_configured(self):
+        cfg = GenerateConfig(
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+            max_thinking_tokens=16,
+        )
+        reasoning_format = self._enable_thinking(
+            cfg, think_end_tag="this-string-should-not-be-used", think_end_token_id=123
+        )
+        self._validate(cfg, reasoning_format=reasoning_format)
+
+        structural_tag = json.loads(cfg.structural_tag)
+        elements = structural_tag["format"]["elements"]
+        self.assertEqual(elements[0]["end"], {"type": "token", "token": 123})
+        self.assertTrue(self._terminate_without_stop_token(cfg))
+
+    def test_reasoning_without_grammar_keeps_think_mode_processor_path(self):
+        cfg = GenerateConfig(response_format={"type": "text"})
+        reasoning_format = self._enable_thinking(cfg)
+        self._validate(cfg, reasoning_format=reasoning_format)
+
+        self.assertIsNone(cfg.structural_tag)
+        self.assertIsNone(cfg.json_schema)
+        self.assertFalse(self._terminate_without_stop_token(cfg))
+
+    def test_reasoning_final_structural_tag_with_existing_budget_rejected(self):
+        cfg = GenerateConfig(
+            structural_tag={
+                "type": "structural_tag",
+                "format": {"type": "any_text", "max_tokens": 3},
+            }
+        )
+        reasoning_format = self._enable_thinking(cfg)
+
+        with self.assertRaises(FtRuntimeException) as ctx:
+            self._validate(cfg, reasoning_format=reasoning_format)
+        self.assertEqual(
+            ctx.exception.exception_type, ExceptionType.UNSUPPORTED_OPERATION
+        )
 
 
-class RawUpdateResponseFormatCoercionTest(TestCase):
-    """update / update_and_pop must run the response_format coercer.
+class RawUpdateAndGrammarConflictTest(TestCase):
+    """Raw request updates still coerce response_format and reject grammar conflicts."""
 
-    The raw HTTP path (request_extractor._format_generate_config) feeds
-    the user dict through update_and_pop. Without coercion, a dict/str
-    response_format envelope lands on the model verbatim, then validate()
-    -> _project_response_format_to_grammar_fields crashes with
-    AttributeError on `rf.type`.
-    """
-
-    def test_update_coerces_dict_envelope(self):
-        cfg = GenerateConfig()
-        cfg.update({"response_format": {"type": "json_object"}})
-        self.assertIsInstance(cfg.response_format, ResponseFormat)
-        cfg.validate()
-        self.assertIsNone(cfg.response_format)
-        self.assertEqual(cfg.json_schema, '{"type": "object"}')
+    def _terminate_without_stop_token(self, cfg: GenerateConfig) -> bool:
+        return ResponseFormatBuilder.grammar_terminate_without_stop_token(cfg)
 
     def test_update_and_pop_coerces_string_envelope(self):
         cfg = GenerateConfig()
@@ -701,40 +737,52 @@ class RawUpdateResponseFormatCoercionTest(TestCase):
             {"response_format": '{"type":"regex","pattern":"\\\\d+"}', "stranger": 1}
         )
         self.assertEqual(remain, {"stranger": 1})
-        self.assertIsInstance(cfg.response_format, ResponseFormat)
         cfg.validate()
+        ResponseFormatBuilder(cfg).apply()
         self.assertEqual(cfg.regex, r"\d+")
+
+    def test_internal_terminate_flag_is_not_dumped_as_user_config(self):
+        cfg = GenerateConfig(
+            grammar_terminate_without_stop_token=True,
+        )
+        self.assertFalse(self._terminate_without_stop_token(cfg))
+        self.assertFalse(hasattr(cfg, "grammar_terminate_without_stop_token"))
+        self.assertNotIn(
+            "grammar_terminate_without_stop_token", GenerateConfig.model_fields
+        )
+        self.assertNotIn("grammar_terminate_without_stop_token", cfg.model_dump())
 
     def test_update_rejects_malformed_envelope(self):
         cfg = GenerateConfig()
-        with self.assertRaises(ValidationError):
-            cfg.update({"response_format": {"type": "json_schema"}})
-
-
-class GrammarConstraintMutualExclusionTest(TestCase):
-    """Only one typed grammar field may be set per request once envelope is projected."""
-
-    def _assert_rejected(self, **fields):
-        cfg = GenerateConfig(**fields)
+        cfg.update({"response_format": {"type": "json_schema"}})
         with self.assertRaises(FtRuntimeException) as ctx:
             cfg.validate()
+            ResponseFormatBuilder(cfg).apply()
+        self.assertEqual(
+            ctx.exception.exception_type, ExceptionType.ERROR_INPUT_FORMAT_ERROR
+        )
+
+    def test_update_and_pop_rejects_invalid_json_envelope(self):
+        cfg = GenerateConfig()
+        remain = cfg.update_and_pop(
+            {"response_format": '{"type":"json_object"', "stranger": 1}
+        )
+        self.assertEqual(remain, {"stranger": 1})
+        with self.assertRaises(FtRuntimeException) as ctx:
+            cfg.validate()
+            ResponseFormatBuilder(cfg).apply()
+        self.assertEqual(
+            ctx.exception.exception_type, ExceptionType.ERROR_INPUT_FORMAT_ERROR
+        )
+
+    def test_multiple_typed_grammar_fields_rejected(self):
+        cfg = GenerateConfig(json_schema='{"type": "object"}', regex=r"\d+")
+        with self.assertRaises(FtRuntimeException) as ctx:
+            cfg.validate()
+            ResponseFormatBuilder(cfg).apply()
         self.assertEqual(
             ctx.exception.exception_type, ExceptionType.UNSUPPORTED_OPERATION
         )
-
-    def test_json_schema_plus_regex_rejected(self):
-        self._assert_rejected(json_schema='{"type": "object"}', regex=r"\d+")
-
-    def test_envelope_overrides_typed_field_no_conflict(self):
-        # response_format takes precedence and clears stale typed fields, so
-        # this is NOT a multi-grammar conflict (matches OpenAI endpoint semantics).
-        cfg = GenerateConfig(
-            json_schema='{"type": "object"}',
-            response_format={"type": "json_object"},
-        )
-        cfg.validate()
-        self.assertIsNone(cfg.response_format)
-        self.assertEqual(cfg.json_schema, '{"type": "object"}')
 
 
 if __name__ == "__main__":

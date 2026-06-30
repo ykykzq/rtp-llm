@@ -83,6 +83,11 @@ public:
     void updateMultiSeqStatus(const std::vector<int>& src_batch_indices) override;
     void updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens) override;
 
+    // MTP score_batch would need per-draft-row combo prefix and dedup state.
+    ScoreBatchRole scoreBatchRole() const override {
+        return ScoreBatchRole::kNormalDecodeOnly;
+    }
+
 public:
     size_t size() const {
         return infos_.size();

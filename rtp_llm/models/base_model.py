@@ -298,6 +298,25 @@ class BaseModel(object):
         self.tokenizer = TokenizerFactory.create(ckpt_path, tokenizer_path, model_type)
         if self.tokenizer.eos_token_id:
             self.model_config.special_tokens.eos_token_id = self.tokenizer.eos_token_id
+        self._fill_xgrammar_tokenizer_info()
+
+    def _fill_xgrammar_tokenizer_info(self) -> None:
+        real_tokenizer = self.tokenizer.get_real_tokenizer()
+        if real_tokenizer is None:
+            return
+
+        try:
+            import xgrammar as xgr
+
+            tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+                real_tokenizer,
+                vocab_size=self.model_config.vocab_size or None,
+            )
+            self.model_config.tokenizer_info_json = tokenizer_info.serialize_json()
+        except Exception as e:
+            message = f"Failed to build xgrammar TokenizerInfo from tokenizer: {e}"
+            logging.warning(message)
+            raise RuntimeError(message) from e
 
     def is_multimodal(self) -> bool:
         return self.model_config.mm_model_config.is_multimodal

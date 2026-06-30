@@ -1,17 +1,15 @@
-from typing import Any, Dict, Literal, Optional
+import json
+from typing import Any, Dict, Literal, Optional, TypeAlias, Union
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ResponseFormatJSONSchema(BaseModel):
-    # `schema` shadows BaseModel.schema() in pydantic v1 and triggers a v2
-    # protected_namespaces UserWarning. The OpenAI wire field is literally
-    # named "schema", so we keep the alias and silence the namespace.
+    # OpenAI wire field is literally "schema"; silence pydantic v2 protected_namespaces warning.
     model_config = ConfigDict(protected_namespaces=())
 
     name: Optional[str] = None
     schema: Optional[Dict[str, Any]] = None
-    strict: Optional[bool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -42,3 +40,24 @@ class ResponseFormat(BaseModel):
                     "response_format.type=structural_tag requires structural_tag"
                 )
         return self
+
+
+def parse_response_format(value: Any) -> Optional[ResponseFormat]:
+    """Parse loose request payloads into a validated ResponseFormat envelope."""
+    if value is None:
+        return None
+    if isinstance(value, ResponseFormat):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        value = json.loads(stripped)
+    if isinstance(value, dict):
+        if not value:
+            return None
+        return ResponseFormat(**value)
+    raise TypeError(f"response_format has unsupported type {type(value).__name__}")
+
+
+ResponseFormatInput: TypeAlias = Union[ResponseFormat, Dict[str, Any], str]

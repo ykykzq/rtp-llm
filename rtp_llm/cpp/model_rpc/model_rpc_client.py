@@ -1,7 +1,6 @@
 import functools
-import json
 import logging
-from typing import Any, AsyncGenerator, Mapping, Optional, Union
+from typing import Any, AsyncGenerator, Optional, Union
 
 import grpc
 from grpc import StatusCode
@@ -35,15 +34,6 @@ from rtp_llm.utils.grpc_util import (
 
 MAX_GRPC_TIMEOUT_SECONDS = 3600
 
-_JSON_PB_KW = {"ensure_ascii": False, "separators": (",", ":")}
-
-
-def _pb_string_value_for_json_field(value: Union[str, Mapping[str, Any]]) -> str:
-    """Protobuf StringValue fields expect a string; GenerateConfig may use dict (e.g. OpenAI response_format)."""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, **_JSON_PB_KW)
-
 
 class StreamState:
     def __init__(self):
@@ -74,6 +64,7 @@ def trans_input(input_py: GenerateInput):
     trans_multimodal_input(input_py, input_pb, input_py.generate_config)
     # check generate config is valid before enter into engine
     input_py.generate_config.validate()
+    input_py.generate_config.apply_response_format()
 
     generate_config_pb = input_pb.generate_config
     generate_config_pb.max_new_tokens = input_py.generate_config.max_new_tokens
@@ -82,9 +73,6 @@ def trans_input(input_py: GenerateInput):
     )
     generate_config_pb.end_think_token_ids.extend(
         input_py.generate_config.end_think_token_ids
-    )
-    generate_config_pb.begin_think_token_ids.extend(
-        input_py.generate_config.begin_think_token_ids
     )
     generate_config_pb.in_think_mode = input_py.generate_config.in_think_mode
     generate_config_pb.num_beams = input_py.generate_config.num_beams
@@ -113,15 +101,16 @@ def trans_input(input_py: GenerateInput):
     trans_option(generate_config_pb, input_py.generate_config, "top_p_min")
     trans_option(generate_config_pb, input_py.generate_config, "top_p_reset_ids")
     if input_py.generate_config.json_schema is not None:
-        generate_config_pb.json_schema.value = _pb_string_value_for_json_field(
-            input_py.generate_config.json_schema
-        )
+        generate_config_pb.json_schema.value = input_py.generate_config.json_schema
     trans_option(generate_config_pb, input_py.generate_config, "regex")
     trans_option(generate_config_pb, input_py.generate_config, "ebnf")
     if input_py.generate_config.structural_tag is not None:
-        generate_config_pb.structural_tag.value = _pb_string_value_for_json_field(
+        generate_config_pb.structural_tag.value = (
             input_py.generate_config.structural_tag
         )
+    generate_config_pb.grammar_terminate_without_stop_token = (
+        input_py.generate_config.grammar_terminate_without_stop_token()
+    )
     trans_option(generate_config_pb, input_py.generate_config, "adapter_name")
     trans_option_cast(
         generate_config_pb, input_py.generate_config, "task_id", functools.partial(str)
@@ -208,9 +197,7 @@ def trans_input(input_py: GenerateInput):
     generate_config_pb.cross_seq_diverge_start_combo = input_py.generate_config.cross_seq_diverge_start_combo
     for i in range(len(input_py.generate_config.banned_combo_token_ids)):
         banned_combo = generate_config_pb.banned_combo_token_ids.rows.add()
-        banned_combo.values.extend(
-            input_py.generate_config.banned_combo_token_ids[i]
-        )
+        banned_combo.values.extend(input_py.generate_config.banned_combo_token_ids[i])
 
     for role_addr in input_py.generate_config.role_addrs:
         role_addr_pb = RoleAddrPB()

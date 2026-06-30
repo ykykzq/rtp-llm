@@ -5,12 +5,10 @@ cc_library(
     name = "sample_infos",
     hdrs = [
         "SampleInfos.h",
-        "SpecLogitsProcessorTypes.h",
     ],
     deps = [
         "//:rtp_compute_ops",
         "//rtp_llm/cpp/utils:tensor_debug_utils",
-        "//rtp_llm/cpp/pybind:py_utils",
     ],
     visibility = ["//visibility:public"],
 )
@@ -45,15 +43,11 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
-# Logits processor - model output processing.
-# The grammar-constrained processors are co-located here so that
-# LogitsProcessorFactory can dispatch structured-output requests directly
-# without a runtime plug-in hook (see dsv4 composition root).
+# Grammar processors co-located so LogitsProcessorFactory dispatches without a runtime plug-in hook.
 cc_library(
     name = "logits_processor",
     hdrs = [
         "logits_processor/BaseLogitsProcessor.h",
-        "logits_processor/LogitsProcessorException.h",
         "logits_processor/SpecLogitsProcessor.h",
         "logits_processor/MultiSeqLogitsProcessor.h",
         "logits_processor/LogitsProcessorStates.h",
@@ -62,12 +56,12 @@ cc_library(
         "logits_processor/RecommendationLogitsProcessor.h",
         "logits_processor/LogitsProcessorFactory.h",
         "logits_processor/GrammarLogitsProcessor.h",
-        "logits_processor/ReasoningGrammarLogitsProcessor.h",
         "logits_processor/SpecLogitsVerifyRunner.h",
         "logits_processor/BitmaskUtils.h",
     ],
     srcs = [
         "logits_processor/BaseLogitsProcessor.cc",
+        "logits_processor/BitmaskUtils.cc",
         "logits_processor/MultiSeqLogitsProcessor.cc",
         "logits_processor/LogitsProcessorStates.cc",
         "logits_processor/ThinkModeLogitsProcessor.cc",
@@ -75,7 +69,6 @@ cc_library(
         "logits_processor/RecommendationLogitsProcessor.cc",
         "logits_processor/LogitsProcessorFactory.cc",
         "logits_processor/GrammarLogitsProcessor.cc",
-        "logits_processor/ReasoningGrammarLogitsProcessor.cc",
         "logits_processor/SpecLogitsVerifyRunner.cc",
     ],
     deps = [
@@ -85,7 +78,6 @@ cc_library(
         "//rtp_llm/cpp/engine_base/stream:generate_types",
         "//rtp_llm/cpp/engine_base/stream:generate_config",
         "//rtp_llm/cpp/config:config_modules",
-        "//rtp_llm/cpp/metrics:metrics",
         "//rtp_llm/cpp/pybind:py_utils",
         "//rtp_llm/cpp/utils:core_utils",
         "//rtp_llm/cpp/utils:error_code",
@@ -94,18 +86,9 @@ cc_library(
         "//:using_cuda": [
             "//rtp_llm/models_py/bindings/cuda/ops:standalone_ops",
         ],
-        "@//:using_rocm": [],
         "//conditions:default": [],
     }),
     copts = copts(),
-    visibility = ["//visibility:public"],
-)
-
-# Back-compat alias: callers historically depended on :grammar_logits_processor;
-# the grammar processors now live in :logits_processor.
-alias(
-    name = "grammar_logits_processor",
-    actual = ":logits_processor",
     visibility = ["//visibility:public"],
 )
 
@@ -162,24 +145,12 @@ cc_library(
         "//rtp_llm/models_py/bindings/core:cache_store_async_writer",
         "//rtp_llm/cpp/utils:debug_utils",
         "//rtp_llm/cpp/utils:profiling_scope",
-        # cuda_graph_base is platform-agnostic struct definitions used by
-        # PyWrappedModel.h (GraphParams/CudaGraphState); safe on all platforms.
-        # cuda_graph_impl/cuda_graph_hdrs_lib pull in the device-specific
-        # runner srcs/headers and only link on CUDA/ROCm.
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
         "//rtp_llm/cpp/cuda_graph:cuda_graph_base",
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
         "//rtp_llm/models_py/bindings/common:fuse_copy_op",
         "//rtp_llm/cpp/multimodal_processor:multimodal_types",
-    ] + select({
-        "//:using_cuda": [
-            "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
-            "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
-        ],
-        "@//:using_rocm": [
-            "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
-            "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
-        ],
-        "//conditions:default": [],
-    }),
+    ],
     visibility = ["//visibility:public"],
 )
 

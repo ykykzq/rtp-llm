@@ -53,12 +53,8 @@ public:
     std::optional<std::string> regex;
     std::optional<std::string> ebnf;
     std::optional<std::string> structural_tag;
-    // The OpenAI response_format envelope is intentionally absent here: the
-    // Python frontend projects it to the four typed fields above in
-    // GenerateConfig.validate(), and the gRPC wire field of the same name is
-    // rejected by QueryConverter when it arrives non-empty. Internal code must
-    // only read the typed fields.
-    std::string                adapter_name = "";
+    bool                       grammar_terminate_without_stop_token = false;
+    std::string                adapter_name                         = "";
     std::vector<std::string>   adapter_names;
 
     std::vector<int>              select_tokens_id;
@@ -98,7 +94,6 @@ public:
 
     bool               in_think_mode       = false;
     int                max_thinking_tokens = 0;
-    std::vector<int>   begin_think_token_ids;
     std::vector<int>   end_think_token_ids;
     bool               gen_timeline = false;
     int                profile_step = 3;
@@ -147,9 +142,7 @@ public:
     }
 
     bool hasStructuredOutputRequest() const noexcept {
-        // Only typed fields carry grammar in C++; the response_format envelope
-        // is projected to these by Python GenerateConfig.validate before the
-        // request reaches the engine.
+        // response_format envelope is projected to typed fields by Python ResponseFormatBuilder.
         return json_schema.has_value() || regex.has_value() || ebnf.has_value() || structural_tag.has_value();
     }
 
@@ -187,7 +180,6 @@ public:
                      << ", stop_words_list:" << vectorsToString(stop_words_list)
                      << ", can_use_pd_separation: " << can_use_pd_separation << ", pd_separation: " << pd_separation
                      << ", in_think_mode: " << in_think_mode << ", max_thinking_tokens: " << max_thinking_tokens
-                     << ", begin_think_token_ids: " << vectorToString(begin_think_token_ids)
                      << ", end_think_token_ids: " << vectorToString(end_think_token_ids)
                      << ", gen_timeline: " << gen_timeline << ", profile_step: " << profile_step
                      << ", reuse_cache: " << reuse_cache << ", enable_device_cache: " << enable_device_cache
@@ -301,7 +293,6 @@ public:
         JSONIZE(sp_advice_prompt_token_ids);
         JSONIZE(in_think_mode);
         JSONIZE(max_thinking_tokens);
-        JSONIZE(begin_think_token_ids);
         JSONIZE(end_think_token_ids);
         JSONIZE(gen_timeline);
         JSONIZE(profile_step);

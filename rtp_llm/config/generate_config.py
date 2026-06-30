@@ -1,6 +1,5 @@
 import copy
 import hashlib
-import json
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -16,7 +15,7 @@ from pydantic import (
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
-from rtp_llm.config.response_format import ResponseFormat
+from rtp_llm.config.response_format import ResponseFormatInput
 from rtp_llm.ops import RoleType
 from rtp_llm.utils.check_util import *
 from rtp_llm.utils.util import check_with_info
@@ -94,7 +93,6 @@ class GenerateConfig(BaseModel):
     )
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     end_think_token_ids: List[int] = []
-    begin_think_token_ids: List[int] = []
     num_beams: int = 1
     variable_num_beams: List[int] = []
     do_sample: bool = True
@@ -147,11 +145,11 @@ class GenerateConfig(BaseModel):
     chat_id: Optional[str] = None
     task_id: Optional[Union[str, int]] = None
     request_format: str = RequestFormat.RAW
-    response_format: Optional[ResponseFormat] = None
+    response_format: Optional[ResponseFormatInput] = None
     json_schema: Optional[Union[str, Dict[str, Any]]] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
-    structural_tag: Optional[str] = None
+    structural_tag: Optional[Union[str, Dict[str, Any]]] = None
     # calculate_loss style: 0 for not calculate; 1 for sum; 2 for each token
     calculate_loss: int = 0
     return_logits: bool = False
@@ -388,28 +386,6 @@ class GenerateConfig(BaseModel):
             return ReturnAllProbsMode.DEFAULT if v else ReturnAllProbsMode.NONE
         return v
 
-    @field_validator("response_format", mode="before")
-    @classmethod
-    def _coerce_response_format(cls, v):
-        """Accept str/dict/ResponseFormat for response_format; envelope shape
-        validation lives in ResponseFormat._check_payload — malformed input
-        (missing inner schema/pattern/grammar/structural_tag, unknown type,
-        wrong inner type) raises here at parse time, never reaches C++."""
-        if v is None:
-            return None
-        if isinstance(v, ResponseFormat):
-            return v
-        if isinstance(v, str):
-            stripped = v.strip()
-            if not stripped:
-                return None
-            v = json.loads(stripped)
-        if isinstance(v, dict):
-            if not v:
-                return None
-            return ResponseFormat(**v)
-        raise TypeError(f"response_format has unsupported type {type(v).__name__}")
-
     def gen_hash_value(self):
         cp = copy.copy(self)
         cp.max_new_tokens = 0
@@ -444,8 +420,6 @@ class GenerateConfig(BaseModel):
         """
         for key, value in new.items():
             if hasattr(self, key):
-                if key == "response_format":
-                    value = self._coerce_response_format(value)
                 setattr(self, key, value)
         # setattr 不会触发 field_validator / model_validator，手动补偿：
         # 1) cross_seq_diverge_start_combo 的 clamp/类型兜底
@@ -467,8 +441,6 @@ class GenerateConfig(BaseModel):
         to_remove: List[str] = []
         for key, value in new.items():
             if hasattr(self, key):
-                if key == "response_format":
-                    value = self._coerce_response_format(value)
                 setattr(self, key, value)
                 to_remove.append(key)
         # setattr 不会触发 field_validator / model_validator，手动补偿：
@@ -515,7 +487,9 @@ class GenerateConfig(BaseModel):
         self.stop_words_list += special_tokens.stop_words_id_list
         self.stop_words_str += special_tokens.stop_words_str_list
 
-    def add_thinking_params(self, tokenizer, generate_env_config):
+    def add_thinking_params(
+        self, tokenizer, generate_env_config, normalize_response_format: bool = True
+    ):
         """Add thinking parameters from generate_env_config.
 
         Args:
@@ -542,6 +516,29 @@ class GenerateConfig(BaseModel):
         self.in_think_mode = (
             bool(generate_env_config.think_mode) and len(self.end_think_token_ids) >= 0
         )
+        if normalize_response_format:
+            self.apply_response_format(generate_env_config=generate_env_config)
+
+    def apply_response_format(
+        self,
+        generate_env_config: Optional[Any] = None,
+        reasoning_format: Optional[Any] = None,
+    ) -> None:
+        from rtp_llm.config.response_format_builder import (
+            ReasoningFormat,
+            ResponseFormatBuilder,
+        )
+
+        if reasoning_format is None and generate_env_config is not None:
+            reasoning_format = ReasoningFormat.from_generate_env_config(
+                generate_env_config
+            )
+        ResponseFormatBuilder(self, reasoning_format=reasoning_format).apply()
+
+    def grammar_terminate_without_stop_token(self) -> bool:
+        from rtp_llm.config.response_format_builder import ResponseFormatBuilder
+
+        return ResponseFormatBuilder.grammar_terminate_without_stop_token(self)
 
     def add_stop_ids_from_str(self, tokenizer):
         ids_list = []
@@ -697,74 +694,6 @@ class GenerateConfig(BaseModel):
         except Exception as e:
             raise FtRuntimeException(ExceptionType.ERROR_INPUT_FORMAT_ERROR, str(e))
 
-        self._project_response_format_to_grammar_fields()
-        self._validate_grammar_constraints()
-
-    def _project_response_format_to_grammar_fields(self) -> None:
-        """Project response_format envelope onto typed grammar fields and clear it.
-
-        After this call, response_format is None and at most one of
-        json_schema/regex/ebnf/structural_tag is set. The typed fields are the
-        single source of truth — C++ never sees the envelope. Envelope shape
-        validation happens in ResponseFormat (pydantic), so any malformed
-        input has already raised before reaching here.
-
-        Top-level response_format is the single source of truth for a
-        request's grammar. Clear every grammar-bearing field first so a stale
-        constraint left over in extra_configs cannot survive — e.g.
-        extra_configs.json_schema=X plus response_format.type='text' must end
-        up unconstrained, not still json-schema-locked.
-        """
-        rf = self.response_format
-        if rf is None:
-            return
-
-        self.json_schema = None
-        self.regex = None
-        self.ebnf = None
-        self.structural_tag = None
-
-        if rf.type == "json_schema":
-            self.json_schema = json.dumps(
-                rf.json_schema.schema, ensure_ascii=False, separators=(",", ":")
-            )
-        elif rf.type == "json_object":
-            self.json_schema = json.dumps({"type": "object"})
-        elif rf.type == "regex":
-            self.regex = rf.pattern
-        elif rf.type == "ebnf":
-            self.ebnf = rf.grammar
-        elif rf.type == "structural_tag":
-            self.structural_tag = json.dumps(
-                rf.structural_tag, ensure_ascii=False, separators=(",", ":")
-            )
-        # rf.type == "text" → leave all four fields cleared (no grammar).
-
-        self.response_format = None
-
-    def _validate_grammar_constraints(self) -> None:
-        # response_format has been projected and cleared by
-        # _project_response_format_to_grammar_fields; only typed fields remain.
-        count = (
-            (self.json_schema is not None)
-            + (self.regex is not None)
-            + (self.ebnf is not None)
-            + (self.structural_tag is not None)
-        )
-        if count > 1:
-            raise FtRuntimeException(
-                ExceptionType.UNSUPPORTED_OPERATION,
-                "only one grammar constraint (json_schema / regex / ebnf / "
-                "structural_tag) may be set per request",
-            )
-        # NormalOutputDispatcher skips per-token matcher advance under beam search → schema-illegal tokens.
-        if count > 0 and (self.has_num_beams() or self.num_return_sequences > 1):
-            raise FtRuntimeException(
-                ExceptionType.UNSUPPORTED_OPERATION,
-                "grammar-constrained decoding (json_schema / regex / ebnf / "
-                "structural_tag) is not supported with beam search "
-                "(num_beams > 1 or num_return_sequences > 1)",
-            )
     def enforce_prompt_scoring_constraints(self):
         """Clamp config fields for prompt scoring mode. Call after setting return_prompt_logits=True."""
         self.max_new_tokens = 1

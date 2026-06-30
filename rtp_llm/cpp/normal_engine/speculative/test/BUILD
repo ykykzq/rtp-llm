@@ -19,9 +19,7 @@ cc_test(
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
     ] + torch_deps(),
-    # FastTopKSampler logic is CPU-only, but linking //rtp_llm/cpp/normal_engine:normal_engine
-    # pulls in libtorch_cuda → libcuda.so.1; without a GPU host the binary fails to load
-    # before any test runs. Schedule on H20 so the loader resolves cleanly.
+    # CPU-only logic but normal_engine links libtorch_cuda; H20 host needed for loader.
     env = {
         "TEST_USING_DEVICE": "CUDA",
     },
@@ -42,7 +40,7 @@ cc_test(
         "//rtp_llm/cpp/cache/test:cache_config_test_utils",
         "//rtp_llm/cpp/normal_engine:normal_engine",
         "//rtp_llm/cpp/models:models",
-        "//rtp_llm/cpp/models:grammar_logits_processor",
+        "//rtp_llm/cpp/models:logits_processor",
         "//rtp_llm/cpp/config:config_modules",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",

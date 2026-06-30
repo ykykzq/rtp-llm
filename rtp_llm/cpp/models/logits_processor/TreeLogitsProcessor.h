@@ -50,6 +50,11 @@ public:
     void updateMultiSeqStatus(const std::vector<int>& src_batch_indices) override;
     void updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens) override;
 
+    // MTP score_batch would need to fork DFA state for each draft row.
+    ScoreBatchRole scoreBatchRole() const override {
+        return ScoreBatchRole::kNormalDecodeOnly;
+    }
+
 public:
     std::vector<std::string> getStatus();
     size_t                   size() {

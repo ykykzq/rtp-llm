@@ -11,6 +11,7 @@ import torch
 
 from rtp_llm.config.generate_config import GenerateConfig
 from rtp_llm.config.py_config_modules import GenerateEnvConfig, RenderConfig
+from rtp_llm.config.response_format_builder import ReasoningFormat
 from rtp_llm.frontend.tokenizer_factory.tokenizers import BaseTokenizer
 from rtp_llm.openai.api_datatype import (
     ChatCompletionExtraOutputs,
@@ -316,6 +317,7 @@ class CustomChatRenderer:
         self.think_mode, self.think_start_tag, self.think_end_tag = _get_think_config(
             generate_env_config
         )
+        self.generate_env_config = generate_env_config
 
         # Store configs for subclasses
         self.ckpt_path = ckpt_path
@@ -348,21 +350,6 @@ class CustomChatRenderer:
         self.extra_stop_words: List[str] = []
         self.extra_stop_word_ids_list: List[List[int]] = []
 
-    def prompt_preopens_think(self, request: ChatCompletionRequest) -> bool:
-        """Return True if the rendered prompt leaves the assistant turn inside
-        an open `<think>` block (Qwen3.5 with enable_thinking=true), so the
-        model's first emitted text belongs to reasoning. Whitespace-tolerant
-        suffix match: chat templates may end the assistant prefix with
-        `<think>`, `<think>\\n`, or `<think>\\n\\n` depending on version."""
-        if not self.think_mode or not self.think_start_tag:
-            return False
-        try:
-            prompt = self.render_chat(request).rendered_prompt
-        except Exception as exc:
-            logging.error("prompt_preopens_think render failed: %s", exc)
-            return False
-        return prompt.rstrip().endswith(self.think_start_tag.strip())
-
     def __str__(self) -> str:
         return str(self.get_renderer_info())
 
@@ -383,6 +370,9 @@ class CustomChatRenderer:
             extra_stop_word_ids_list=extra_stop_word_ids_list,
             extra_stop_words_list=extra_stop_words_list,
         )
+
+    def get_reasoning_format(self) -> ReasoningFormat:
+        return ReasoningFormat.from_generate_env_config(self.generate_env_config)
 
     def add_extra_stop_words(self, extra_stop_words: List[str]):
         self.extra_stop_words.extend(extra_stop_words)

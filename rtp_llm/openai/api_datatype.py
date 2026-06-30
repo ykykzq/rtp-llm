@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 from rtp_llm.config.generate_config import GenerateConfig
-from rtp_llm.config.response_format import ResponseFormat, ResponseFormatJSONSchema
+from rtp_llm.config.response_format import ResponseFormat
 from rtp_llm.utils.base_model_datatypes import AuxInfo
 
 
