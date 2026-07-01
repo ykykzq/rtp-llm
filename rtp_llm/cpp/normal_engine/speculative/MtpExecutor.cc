@@ -12,6 +12,7 @@
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
+#include "rtp_llm/cpp/models/ModelInputsLogger.h"
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorFactory.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -22,6 +23,14 @@
 #include <random>
 
 namespace rtp_llm {
+
+GptModelOutputs MtpExecutor::forwardModel(ModelBase* model, const GptModelInputs& inputs, ModelInputsModelRole role) {
+    RTP_LLM_CHECK_WITH_INFO(model != nullptr, "model is null before forward");
+    if (model_inputs_logger_) {
+        model_inputs_logger_->log(inputs, role, model->model_id_);
+    }
+    return model->forward(inputs);
+}
 
 bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
@@ -135,6 +144,10 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     tp_rank_            = params.parallelism_config.tp_rank;
     parallelism_config_ = params.parallelism_config;
     RTP_LLM_LOG_INFO("enable_detail_log_ = %d, tp_rank_ = %d", enable_detail_log_, tp_rank_);
+    if (params.profiling_debug_logging_config.enable_model_inputs_log) {
+        model_inputs_logger_ = std::make_shared<ModelInputsLogger>(
+            params.parallelism_config.world_rank, params.profiling_debug_logging_config.log_file_backup_count);
+    }
 
     if (params.eplb_config.enable_eplb() && params.model_config_.moe_style != 0) {
         // use first moe layer weight as moe weight type
@@ -218,8 +231,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
 
     if (!params.py_model.is_none()) {
         RTP_LLM_LOG_INFO("init executor with python model");
-        model_.reset(new PyWrappedModel(
-            model_init_params, params.py_model, false, true));
+        model_.reset(new PyWrappedModel(model_init_params, params.py_model, false, true));
     }
 
     // when warmup, cache manager maybe nullptr
@@ -260,8 +272,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                 cache_manager});
         if (!params.py_sp_model.is_none()) {
             RTP_LLM_LOG_INFO("[speculative decoding] using py model");
-            draft_model_.reset(new PyWrappedModel(
-                model_params, params.py_sp_model, false, false));
+            draft_model_.reset(new PyWrappedModel(model_params, params.py_sp_model, false, false));
             // Create separate model for speculative prefill with CUDA graph if enabled (from params)
             const bool enable_cuda_graph = params.hw_kernel_config.enable_cuda_graph;
             RTP_LLM_LOG_INFO(
@@ -270,8 +281,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
             if (enable_cuda_graph) {
                 RTP_LLM_LOG_INFO(
                     "[speculative decoding] creating separate prefill draft model with CUDA graph support");
-                sp_prefill_draft_model_.reset(new PyWrappedModel(
-                    model_params, params.py_sp_model, true, false));
+                sp_prefill_draft_model_.reset(new PyWrappedModel(model_params, params.py_sp_model, true, false));
             }
         }
         break;  // NOTE: only support one mtp model now
@@ -378,7 +388,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         RTP_LLM_PROFILE_SCOPE("executor.mtp.prefill_step(target_model_forward)");
         maybePrintModelInput(model_input, "prefill target model");
         model_input.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
-        model_output                        = std::move(model_->forward(model_input));
+        model_output = std::move(forwardModel(model_.get(), model_input, ModelInputsModelRole::TARGET));
     }
 
     // eplb
@@ -412,7 +422,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         model_input.kv_block_stride_bytes   = mtp_cache_cfg.kv_block_stride_bytes;
         model_input.kv_scale_stride_bytes   = mtp_cache_cfg.kv_scale_stride_bytes;
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
-        draft_model_output                  = std::move(draft_model_->forward(model_input));
+        draft_model_output = std::move(forwardModel(draft_model_.get(), model_input, ModelInputsModelRole::DRAFT));
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
@@ -627,7 +637,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             model_input.input_lengths.size(0),
             model_input.prefix_lengths.size(0),
             model_input.sequence_lengths.size(0));
-        model_output = std::move(model_->forward(model_input));
+        model_output = std::move(forwardModel(model_.get(), model_input, ModelInputsModelRole::TARGET));
         RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
         model_input.is_target_verify = false;
     }
@@ -703,9 +713,11 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         if (sp_prefill_draft_model_) {
             // All currently supported draft models are non-MRoPE and do not use
             // model_input.combo_position_ids, so the draft prefill CUDA graph does not need to copy it.
-            draft_prefill_model_output = std::move(sp_prefill_draft_model_->forward(model_input));
+            draft_prefill_model_output = std::move(
+                forwardModel(sp_prefill_draft_model_.get(), model_input, ModelInputsModelRole::DRAFT_PREFILL));
         } else {
-            draft_prefill_model_output = std::move(draft_model_->forward(model_input));
+            draft_prefill_model_output =
+                std::move(forwardModel(draft_model_.get(), model_input, ModelInputsModelRole::DRAFT_PREFILL));
         }
     }
 
@@ -883,7 +895,8 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     for (int i = 0; i < propose_step_ - 1; i++) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(loop_iter=%d)", i);
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d/%d start, batch_size %zu", i, propose_step_ - 1, batch_size);
-        draft_decode_model_output = std::move(draft_model_->forward(model_input));
+        draft_decode_model_output =
+            std::move(forwardModel(draft_model_.get(), model_input, ModelInputsModelRole::DRAFT));
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d forward done", i);
 
         // sample

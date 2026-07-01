@@ -32,3 +32,14 @@ cc_test(
     },
     exec_properties = {'gpu':'H20'},
 )
+
+cc_test(
+    name = "model_inputs_logger_test",
+    srcs = ["ModelInputsLoggerTest.cc"],
+    copts = test_copts,
+    deps = [
+        "//rtp_llm/cpp/models:model_inputs_logger",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ] + torch_deps(),
+)
