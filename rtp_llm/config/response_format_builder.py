@@ -14,44 +14,28 @@ from rtp_llm.config.grammar_constraint import (
 )
 from rtp_llm.config.response_format import parse_response_format
 
-DEFAULT_THINK_END_TAG = "</think>\n\n"
-
 
 @dataclass(frozen=True)
 class ReasoningFormat:
     """Server/model resolved reasoning envelope format used for grammar wrapping."""
 
-    tag_end: Union[str, List[str], Dict[str, Any]] = DEFAULT_THINK_END_TAG
+    tag_end: Union[str, List[str], Dict[str, Any]]
     suffix: str = ""
-
-    @staticmethod
-    def decode_env_tag(tag: str) -> str:
-        return tag.encode("utf-8").decode("unicode_escape")
 
     @classmethod
     def from_generate_env_config(cls, generate_env_config: Any) -> "ReasoningFormat":
-        raw_tag = generate_env_config.think_end_tag or DEFAULT_THINK_END_TAG
-        tag = cls.decode_env_tag(str(raw_tag))
         raw_token_id = generate_env_config.think_end_token_id
         token_id = -1 if raw_token_id is None else int(raw_token_id)
         if token_id != -1:
             return cls(tag_end={"type": "token", "token": int(token_id)})
+        raw_tag = generate_env_config.think_end_tag
+        if raw_tag is None:
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                "think_end_tag is required when think_end_token_id is not set",
+            )
+        tag = str(raw_tag).encode("utf-8").decode("unicode_escape")
         return cls(tag_end=tag)
-
-    def token_end_id(self) -> Optional[int]:
-        if not isinstance(self.tag_end, dict):
-            return None
-        if self.tag_end.get("type") != "token":
-            return None
-        token = self.tag_end.get("token")
-        if isinstance(token, bool) or not isinstance(token, int):
-            return None
-        return int(token)
-
-    def stop_text(self) -> Optional[str]:
-        if not isinstance(self.tag_end, str):
-            return None
-        return self.tag_end + self.suffix
 
     def prefix_format(self, max_thinking_tokens: int) -> Dict[str, Any]:
         think_tag = {
@@ -79,7 +63,7 @@ class ResponseFormatBuilder:
 
     def __init__(self, config: Any, reasoning_format: Optional[ReasoningFormat] = None):
         self.config = config
-        self.reasoning_format = reasoning_format or ReasoningFormat()
+        self.reasoning_format = reasoning_format
 
     def apply(self) -> None:
         constraint = self._resolve_grammar_constraint()
@@ -87,18 +71,28 @@ class ResponseFormatBuilder:
         if not self.config.in_think_mode:
             return
 
-        if self._reasoning_envelope_final_is_json() is not None:
+        if self._existing_reasoning_envelope_final_format() is not None:
             return
+
+        if self.reasoning_format is None:
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                "reasoning_format is required when in_think_mode is enabled",
+            )
 
         if constraint is not None:
             self._wrap_grammar_with_reasoning_envelope(constraint)
+        else:
+            self._wrap_final_format_with_reasoning_envelope({"type": "any_text"})
 
     @classmethod
     def grammar_terminate_without_stop_token(cls, config: Any) -> bool:
         if config.json_schema is not None:
             return True
-        final_is_json = cls(config)._reasoning_envelope_final_is_json()
-        return final_is_json is True
+        final_format = cls(config)._existing_reasoning_envelope_final_format()
+        return (
+            final_format is not None and final_format.get("type") == "json_schema"
+        )
 
     def _project_response_format_to_grammar_fields(self) -> None:
         """Project response_format onto typed fields and clear it; rf wins over stale extra_configs grammar."""
@@ -186,7 +180,8 @@ class ResponseFormatBuilder:
                 "(num_beams > 1 or num_return_sequences > 1)",
             )
 
-    def _reasoning_envelope_final_is_json(self) -> Optional[bool]:
+    def _existing_reasoning_envelope_final_format(self) -> Optional[Dict[str, Any]]:
+        """Return final output format if structural_tag is already reasoning-wrapped."""
         if self.config.structural_tag is None:
             return None
         structural_tag = load_json_field("structural_tag", self.config.structural_tag)
@@ -200,52 +195,45 @@ class ResponseFormatBuilder:
         elements = format_node.get("elements")
         if not isinstance(elements, list):
             return None
-        final_format = self._extract_reasoning_envelope_final_format(elements)
-        if final_format is None:
+        if len(elements) not in (2, 3):
             return None
-        return final_format.get("type") == "json_schema"
 
-    @classmethod
-    def _extract_reasoning_envelope_final_format(
-        cls, elements: list[Any]
-    ) -> Optional[Dict[str, Any]]:
-        if len(elements) < 2 or not cls._looks_like_reasoning_think_tag(elements[0]):
+        reasoning_prefix = elements[0]
+        if not isinstance(reasoning_prefix, dict):
             return None
-        final_index = 1
+        content = reasoning_prefix.get("content")
         if (
-            len(elements) >= 3
-            and isinstance(elements[1], dict)
-            and elements[1].get("type") == "const_string"
+            reasoning_prefix.get("type") != "tag"
+            or reasoning_prefix.get("begin") != ""
+            or not isinstance(content, dict)
+            or content.get("type") != "any_text"
+            or content.get("max_tokens") is None
+            or "end" not in reasoning_prefix
         ):
-            final_index = 2
-        if len(elements) != final_index + 1:
             return None
-        final_format = elements[final_index]
-        if not isinstance(final_format, dict):
-            return None
-        if has_bounded_region(final_format):
+
+        if len(elements) == 3:
+            suffix = elements[1]
+            if not isinstance(suffix, dict) or suffix.get("type") != "const_string":
+                return None
+            final_format = elements[2]
+        else:
+            final_format = elements[1]
+
+        if not isinstance(final_format, dict) or has_bounded_region(final_format):
             return None
         return final_format
-
-    @staticmethod
-    def _looks_like_reasoning_think_tag(node: Any) -> bool:
-        if not isinstance(node, dict):
-            return False
-        if node.get("type") != "tag" or node.get("begin") != "":
-            return False
-        content = node.get("content")
-        if not isinstance(content, dict):
-            return False
-        return (
-            content.get("type") == "any_text"
-            and content.get("max_tokens") is not None
-            and "end" in node
-        )
 
     def _wrap_grammar_with_reasoning_envelope(
         self, constraint: GrammarConstraint
     ) -> None:
         final_format = constraint.final_format_node()
+        self._wrap_final_format_with_reasoning_envelope(final_format)
+
+    def _wrap_final_format_with_reasoning_envelope(
+        self, final_format: Dict[str, Any]
+    ) -> None:
+        assert self.reasoning_format is not None
         reasoning_prefix = self.reasoning_format.prefix_format(
             self.config.max_thinking_tokens
         )

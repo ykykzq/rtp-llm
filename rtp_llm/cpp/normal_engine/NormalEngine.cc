@@ -8,7 +8,6 @@
 #include "rtp_llm/cpp/engine_base/schedulers/PDFusionRatioScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
-#include "rtp_llm/cpp/engine_base/grammar/XGrammarBackend.h"
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPromptConstructor.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
@@ -67,7 +66,6 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
     model_config_(params.model_config_),
     parallelism_config(params.parallelism_config),
     runtime_config(params.runtime_config),
-    grammar_config_(params.grammar_config),
     eplb_config(params.eplb_config),
     pd_sep_config(params.pd_sep_config),
     profiling_debug_logging_config(params.profiling_debug_logging_config),
@@ -135,13 +133,6 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
 
 void NormalEngine::initExecutor(const EngineInitParams&                        params,
                                 std::unique_ptr<ProposeModelEngineInitParams>& propose_params) {
-    // Engine-scoped grammar backend: bound to this engine's tokenizer and carried
-    // via ResourceContext to every stream this engine creates. Avoids the previous
-    // process-global backend, which would be overwritten by any other engine
-    // (e.g. MTP draft executor) and could mask logits with the wrong tokenizer.
-    resource_context_.grammar_backend =
-        XGrammarBackend::create(params.model_config_.tokenizer_info_json, params.grammar_config);
-
     if (propose_params_) {
         executor_.reset(new MtpExecutor(params,
                                         propose_params,

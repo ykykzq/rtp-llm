@@ -1,33 +1,33 @@
 #pragma once
 
-#include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
-#include "rtp_llm/cpp/utils/ErrorCode.h"
-
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
+#include "rtp_llm/cpp/utils/ErrorCode.h"
+
 namespace rtp_llm {
 
+class ModelConfig;
 class XGrammarBackend;
-
-struct LogitsProcessorFactoryParams {
-    std::shared_ptr<XGrammarBackend> grammar_backend;
-    std::shared_ptr<GenerateInput>   generate_input;
-    int32_t                          init_batch_size = 0;
-    int32_t                          max_batch_size  = 0;
-    int64_t                          eos_token_id    = 0;
-};
+struct GrammarConfig;
 
 class LogitsProcessorFactory {
 public:
-    // Process-wide one-time init: loads tree-decode prefix dictionary.
-    static void init(const std::string& ckpt_path, const std::string& tree_decode_config);
+    static void init(const ModelConfig&   model_config,
+                     const GrammarConfig& grammar_config,
+                     const std::string&   tree_decode_config);
 
-    // Build-time errors come back as non-ok ErrorResult; caller surfaces on the stream.
-    static ErrorResult<std::vector<BaseLogitsProcessorPtr>>
-    createLogitsProcessors(const LogitsProcessorFactoryParams& params);
+    static ErrorResult<LogitsProcessors>
+    createLogitsProcessors(std::shared_ptr<GenerateInput> generate_input,
+                           int32_t init_batch_size,
+                           int32_t max_batch_size,
+                           int64_t eos_token_id);
+
+private:
+    static std::shared_ptr<XGrammarBackend>& grammarBackend();
 };
 
 }  // namespace rtp_llm
