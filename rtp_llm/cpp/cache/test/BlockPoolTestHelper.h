@@ -10,14 +10,13 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/config/ModelConfig.h"
-#include "rtp_llm/models_py/bindings/core/ExecOps.h"
-
+#include "rtp_llm/cpp/runtime/CudaRuntime.h"
 namespace rtp_llm {
 
 struct TestKVCacheSpec: public KVCacheSpec {
-    DataType dtype = DataType::TYPE_INVALID;
-    size_t   k_block_bytes = 0;
-    size_t   v_block_bytes = 0;
+    DataType dtype             = DataType::TYPE_INVALID;
+    size_t   k_block_bytes     = 0;
+    size_t   v_block_bytes     = 0;
     size_t   k_scale_bytes     = 0;
     size_t   v_scale_bytes     = 0;
     uint32_t local_kv_head_num = 1;
@@ -87,12 +86,12 @@ inline KVCacheSpecPtr createTestKvCacheSpec(uint32_t          layer_num,
     auto spec                = std::make_shared<TestKVCacheSpec>();
     spec->tag                = "default";
     spec->type               = k_block_stride_bytes == v_block_stride_bytes ? KVCacheSpecType::MultiHeadAttention :
-                                                                             KVCacheSpecType::MultiHeadLatentAttention;
+                                                                              KVCacheSpecType::MultiHeadLatentAttention;
     spec->seq_size_per_block = seq_size_per_block;
     spec->dtype              = dtype;
     spec->k_block_bytes      = k_block_stride_bytes;
     spec->v_block_bytes      = v_block_stride_bytes;
-    spec->local_kv_head_num = local_head_num_kv;
+    spec->local_kv_head_num  = local_head_num_kv;
     return spec;
 }
 

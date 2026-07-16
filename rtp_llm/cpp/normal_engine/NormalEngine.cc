@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
+#include "rtp_llm/cpp/runtime/CudaRuntime.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
@@ -46,7 +47,7 @@ void releaseHostMemoryCache() {
 }
 
 std::vector<int32_t> flattenLayerToGroup(const CacheConfig& cache_config) {
-    auto layer_to_group_ids = cache_config.layerGroupIdsSnapshot();
+    auto                 layer_to_group_ids = cache_config.layerGroupIdsSnapshot();
     std::vector<int32_t> layer_to_group;
     layer_to_group.reserve(layer_to_group_ids.size());
     for (size_t layer = 0; layer < layer_to_group_ids.size(); ++layer) {
@@ -262,12 +263,10 @@ WarmUpResult NormalEngine::prefillWarmUp(const EngineInitParams& params) {
     auto fake_input                                   = makeFakeInput((size_t)model_config_.max_seq_len - 1);
     fake_input->generate_config->num_return_sequences = runtime_config.fifo_scheduler_config.max_context_batch_size;
     fake_input->generate_config->calculate_loss       = int(runtime_config.warm_up_with_loss);
-    rtp_llm::setTraceMemory(true);
     executor_.reset(new NormalExecutor(
         params, nullptr, true, false, 0, mla_ops_type_, kv_cache_group_num_, kv_cache_layer_to_group_));
     THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::prefill_warm_up));
     const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
-    rtp_llm::setTraceMemory(false);
     (void)executor_.reset(nullptr);
     cudaDeviceSynchronize();
     c10::cuda::CUDACachingAllocator::emptyCache();
@@ -284,9 +283,8 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
     auto fake_input                                   = makeFakeInput((size_t)model_config_.max_seq_len - 1);
     fake_input->generate_config->num_return_sequences = runtime_config.max_generate_batch_size;
     fake_input->generate_config->calculate_loss       = int(runtime_config.warm_up_with_loss);
-    rtp_llm::setTraceMemory(true);
 
-    auto cache_config               = CacheConfigCreator::createBasicConfig(model_config_, parallelism_config, false, 0);
+    auto cache_config = CacheConfigCreator::createBasicConfig(model_config_, parallelism_config, false, 0);
     cache_config.seq_size_per_block = model_config_.attn_config.tokens_per_block;
     cache_config.block_num          = 5;
     ParallelismConfig temp_parallelism_config;
@@ -296,7 +294,7 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
     if (!cache_manager->init()) {
         RTP_LLM_FAIL("init kv cache manager failed in decodeWarmUp");
     }
-    const auto& temp_cache_config = cache_manager->cacheConfig();
+    const auto& temp_cache_config   = cache_manager->cacheConfig();
     auto        temp_layer_to_group = flattenLayerToGroup(temp_cache_config);
     executor_.reset(new NormalExecutor(params,
                                        cache_manager,
@@ -308,7 +306,6 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
                                        temp_layer_to_group));
     THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::decode_warm_up));
     const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
-    rtp_llm::setTraceMemory(false);
     (void)executor_.reset(nullptr);
     cudaDeviceSynchronize();
     c10::cuda::CUDACachingAllocator::emptyCache();

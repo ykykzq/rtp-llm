@@ -13,7 +13,7 @@
 #include <cuda_fp8.h>
 #endif
 
-#include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include "rtp_llm/cpp/runtime/CudaRuntime.h"
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
@@ -264,30 +264,32 @@ protected:
                                              torch::indexing::Slice()})
                                      .contiguous();
                     } else {
-                        kblock = kvCache
-                                     .index({torch::indexing::Slice(),
-                                             static_cast<int64_t>(i),
-                                             torch::indexing::Slice(),
-                                             torch::indexing::Slice(block_start, block_end),
-                                             torch::indexing::Slice()})
-                                     .reshape(std::vector<int64_t>{2,
-                                                                   static_cast<int64_t>(cache_config.seq_size_per_block),
-                                                                   static_cast<int64_t>(local_kv_heads),
-                                                                   static_cast<int64_t>(size_per_head)})
-                                     .transpose(2, 1)
-                                     .contiguous();
+                        kblock =
+                            kvCache
+                                .index({torch::indexing::Slice(),
+                                        static_cast<int64_t>(i),
+                                        torch::indexing::Slice(),
+                                        torch::indexing::Slice(block_start, block_end),
+                                        torch::indexing::Slice()})
+                                .reshape(std::vector<int64_t>{2,
+                                                              static_cast<int64_t>(cache_config.seq_size_per_block),
+                                                              static_cast<int64_t>(local_kv_heads),
+                                                              static_cast<int64_t>(size_per_head)})
+                                .transpose(2, 1)
+                                .contiguous();
                         // vblock is written with the same helper as kblock.
-                        vblock = kvCache
-                                     .index({torch::indexing::Slice(),
-                                             static_cast<int64_t>(i),
-                                             1,
-                                             torch::indexing::Slice(block_start, block_end),
-                                             torch::indexing::Slice()})
-                                     .reshape(std::vector<int64_t>{static_cast<int64_t>(cache_config.seq_size_per_block),
-                                                                   static_cast<int64_t>(local_kv_heads),
-                                                                   static_cast<int64_t>(size_per_head)})
-                                     .transpose(1, 0)
-                                     .contiguous();
+                        vblock =
+                            kvCache
+                                .index({torch::indexing::Slice(),
+                                        static_cast<int64_t>(i),
+                                        1,
+                                        torch::indexing::Slice(block_start, block_end),
+                                        torch::indexing::Slice()})
+                                .reshape(std::vector<int64_t>{static_cast<int64_t>(cache_config.seq_size_per_block),
+                                                              static_cast<int64_t>(local_kv_heads),
+                                                              static_cast<int64_t>(size_per_head)})
+                                .transpose(1, 0)
+                                .contiguous();
                     }
                     // std::cout << "index: " << k << " start: " << block_start << " end: " << block_end << std::endl;
                     // std::cout << "block index: " << k_indexs[k] << std::endl;

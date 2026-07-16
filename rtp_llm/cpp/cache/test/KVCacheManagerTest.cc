@@ -17,6 +17,7 @@
 #include "rtp_llm/cpp/cache/connector/test/mock/MockKVCacheConnectorCoordinator.h"
 #include "rtp_llm/cpp/cache/connector/test/mock/MockKVCacheConnectorReadWriteContext.h"
 #include "rtp_llm/cpp/utils/Logger.h"
+#include "rtp_llm/cpp/core/CopyOps.h"
 
 namespace rtp_llm {
 namespace test {

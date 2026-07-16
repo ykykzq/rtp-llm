@@ -1,4 +1,5 @@
 load("//:def.bzl", "copts")
+load("@arch_config//:arch_select.bzl", "torch_deps")
 
 # Sample infos - model sampling data structures
 cc_library(
@@ -111,14 +112,17 @@ cc_library(
 
 cc_library(
     name = "models",
-    hdrs = glob([
-        "*.h",
-    ]),
-    srcs = glob([
-        "*.cc",
-    ]),
+    hdrs = glob(
+        ["*.h"],
+        exclude = ["SamplingOps.h"],
+    ),
+    srcs = glob(
+        ["*.cc"],
+        exclude = ["SamplingOps.cc"],
+    ),
     deps = [
         ":sample_infos",
+        ":sampling_ops",
         ":logits_processor",
         ":dfa_utils",
         ":context_parallel",
@@ -133,10 +137,22 @@ cc_library(
         "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
         "//rtp_llm/cpp/cuda_graph:cuda_graph_base",
         "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
-        "//rtp_llm/models_py/bindings/common:fuse_copy_op",
         "//rtp_llm/cpp/multimodal_processor:multimodal_types",
+        "//rtp_llm/cpp/core:copy_ops",
+        "//rtp_llm/cpp/runtime:cuda_runtime",
     ],
     visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "sampling_ops",
+    hdrs = ["SamplingOps.h"],
+    srcs = ["SamplingOps.cc"],
+    deps = [
+        "//rtp_llm/models_py/bindings/core:op_data",
+    ],
+    visibility = ["//visibility:public"],
+    alwayslink = True,
 )
 
 # Expert statistics - monitoring component
@@ -144,8 +160,14 @@ cc_library(
     name = "stats",
     hdrs = [
         "eplb/stats/ExpertStats.h",
+        "eplb/stats/MoeExpertStats.h",
     ],
+    srcs = [
+        "eplb/stats/MoeExpertStats.cc",
+    ],
+    deps = torch_deps(),
     visibility = ["//visibility:public"],
+    alwayslink = True,
 )
 
 # EPLB configuration

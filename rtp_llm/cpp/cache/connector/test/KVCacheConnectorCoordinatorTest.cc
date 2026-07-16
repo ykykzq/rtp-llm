@@ -12,7 +12,7 @@
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/cache/connector/Meta.h"
-#include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include "rtp_llm/cpp/runtime/CudaRuntime.h"
 #include "rtp_llm/cpp/config/ModelConfig.h"
 #include "rtp_llm/cpp/config/EplbConfig.h"
 
@@ -312,12 +312,12 @@ TEST_F(KVCacheConnectorCoordinatorTest, Init_ReturnTrue_WhenMemoryEnabled_HappyP
 }
 
 TEST_F(KVCacheConnectorCoordinatorTest, AsyncRead_ReturnNull_WhenStop) {
-    CacheConfig cache_config = makeSimpleMhaCacheConfig(/*layer_num=*/1,
-                                                       /*block_num=*/1,
-                                                       /*tokens_per_block=*/4,
-                                                       rtp_llm::TYPE_FP16,
-                                                       /*local_head_num_kv=*/1,
-                                                       /*size_per_head=*/1);
+    CacheConfig cache_config      = makeSimpleMhaCacheConfig(/*layer_num=*/1,
+                                                        /*block_num=*/1,
+                                                        /*tokens_per_block=*/4,
+                                                        rtp_llm::TYPE_FP16,
+                                                        /*local_head_num_kv=*/1,
+                                                        /*size_per_head=*/1);
     cache_config.block_size_bytes = 1;
 
     auto allocator   = std::make_shared<testing::NiceMock<MockKVCacheAllocator>>(cache_config);
@@ -490,12 +490,12 @@ TEST_F(KVCacheConnectorCoordinatorTest, AsyncRead_ReturnContextAndEnqueue_WhenHa
 }
 
 TEST_F(KVCacheConnectorCoordinatorTest, AsyncWrite_ReturnNull_WhenStop) {
-    CacheConfig cache_config = makeSimpleMhaCacheConfig(/*layer_num=*/1,
-                                                       /*block_num=*/1,
-                                                       /*tokens_per_block=*/4,
-                                                       rtp_llm::TYPE_FP16,
-                                                       /*local_head_num_kv=*/1,
-                                                       /*size_per_head=*/1);
+    CacheConfig cache_config      = makeSimpleMhaCacheConfig(/*layer_num=*/1,
+                                                        /*block_num=*/1,
+                                                        /*tokens_per_block=*/4,
+                                                        rtp_llm::TYPE_FP16,
+                                                        /*local_head_num_kv=*/1,
+                                                        /*size_per_head=*/1);
     cache_config.block_size_bytes = 1;
 
     auto allocator   = std::make_shared<testing::NiceMock<MockKVCacheAllocator>>(cache_config);

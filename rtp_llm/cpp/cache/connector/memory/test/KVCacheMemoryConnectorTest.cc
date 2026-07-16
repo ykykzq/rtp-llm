@@ -20,7 +20,8 @@
 #include "rtp_llm/cpp/cache/SingleTypeKVCacheAllocator.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/models_py/bindings/cuda/cuda_host_utils.h"
-#include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include "rtp_llm/cpp/core/CopyOps.h"
+#include "rtp_llm/cpp/runtime/CudaRuntime.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
@@ -134,8 +135,8 @@ private:
                                       int               block_num          = 10,
                                       int               seq_size_per_block = 8,
                                       rtp_llm::DataType mha_dtype          = rtp_llm::DataType::TYPE_FP16) {
-        constexpr int kTestMemoryCacheSizeMb      = 64;
-        constexpr int kTestMemoryCacheSyncTimeout = 1000;
+        constexpr int kTestMemoryCacheSizeMb          = 64;
+        constexpr int kTestMemoryCacheSyncTimeout     = 1000;
         kv_cache_config_.memory_cache_size_mb         = kTestMemoryCacheSizeMb;
         kv_cache_config_.memory_cache_sync_timeout_ms = kTestMemoryCacheSyncTimeout;
         return makeSimpleMhaCacheConfig(layer_num,
@@ -377,8 +378,8 @@ private:
     makeCacheResource(const CacheKeysType&                          cache_keys,
                       const std::vector<std::vector<BlockIdxType>>& per_layer_block_indices,
                       size_t                                        reuse_len = 0) const {
-        auto res = std::make_shared<KVCacheResource>();
-        res->cacheKeys() = cache_keys;
+        auto res                                = std::make_shared<KVCacheResource>();
+        res->cacheKeys()                        = cache_keys;
         const size_t                  layer_num = static_cast<size_t>(cache_config_.layer_all_num);
         std::vector<std::vector<int>> layer_to_group_ids(layer_num, std::vector<int>{0});
         res->initGroups(/*group_num=*/1, static_cast<int>(layer_num), layer_to_group_ids);
@@ -402,13 +403,12 @@ private:
         return res;
     }
 
-    std::shared_ptr<KVCacheResource>
-    makeHybridCacheResource(const CacheKeysType& cache_keys,
-                            const std::vector<BlockIdxType>& group0_blocks,
-                            const std::vector<BlockIdxType>& group1_blocks,
-                            size_t reuse_len = 0) const {
-        auto res = std::make_shared<KVCacheResource>();
-        res->cacheKeys() = cache_keys;
+    std::shared_ptr<KVCacheResource> makeHybridCacheResource(const CacheKeysType&             cache_keys,
+                                                             const std::vector<BlockIdxType>& group0_blocks,
+                                                             const std::vector<BlockIdxType>& group1_blocks,
+                                                             size_t                           reuse_len = 0) const {
+        auto res               = std::make_shared<KVCacheResource>();
+        res->cacheKeys()       = cache_keys;
         const size_t layer_num = static_cast<size_t>(cache_config_.layer_all_num);
         RTP_LLM_CHECK_WITH_INFO(layer_num == 4, "test helper expects 4 layers, got %zu", layer_num);
         std::vector<std::vector<int>> layer_to_group_ids{{0}, {0}, {1}, {1}};
@@ -660,8 +660,8 @@ TEST_F(KVCacheMemoryConnectorTest, asyncMatch_ReturnNull_WhenNoPrefixMatched) {
 TEST_F(KVCacheMemoryConnectorTest, asyncMatch_ReturnMatchedNum_WithHybridGroups) {
     CacheKeysType cache_keys{71001, 71002, 71003};
     auto          res = makeHybridCacheResource(cache_keys,
-                                                /*group0_blocks=*/{1, 2, 3},
-                                                /*group1_blocks=*/{4, 5, 6});
+                                       /*group0_blocks=*/{1, 2, 3},
+                                       /*group1_blocks=*/{4, 5, 6});
     ASSERT_EQ(res->layerBlocks().size(), static_cast<size_t>(cache_config_.layer_all_num));
     putItemsToCache({cache_keys[0]}, memoryCacheBlockBytes());
 
@@ -804,10 +804,10 @@ TEST_F(KVCacheMemoryConnectorTest, asyncRead_InvalidInputs_ReturnNullOrThrow) {
 
     // uninitialized legacy layer view
     // NOTE: asyncRead always skips the last cache_key (cache_keys.size() - 1), so keep size >= 2 here.
-    auto res_empty_lbs = std::make_shared<KVCacheResource>();
+    auto res_empty_lbs         = std::make_shared<KVCacheResource>();
     res_empty_lbs->cacheKeys() = {1, 2};
-    auto ctx_empty_lbs = connector_->asyncRead(
-        res_empty_lbs, nullptr, nullptr, /*start_read_block_index=*/0, /*read_block_num=*/1);
+    auto ctx_empty_lbs =
+        connector_->asyncRead(res_empty_lbs, nullptr, nullptr, /*start_read_block_index=*/0, /*read_block_num=*/1);
     EXPECT_EQ(ctx_empty_lbs, nullptr);
 }
 
@@ -1132,7 +1132,7 @@ TEST_F(KVCacheMemoryConnectorTest, asyncWrite_InvalidInputs_ReturnNullOrThrow) {
     EXPECT_EQ(ctx1, nullptr);
 
     // uninitialized legacy layer view
-    auto res_empty_lbs = std::make_shared<KVCacheResource>();
+    auto res_empty_lbs         = std::make_shared<KVCacheResource>();
     res_empty_lbs->cacheKeys() = {1};
     res_empty_lbs->setLastBlockAligned(true);
     auto ctx_empty_lbs = connector_->asyncWrite(res_empty_lbs, meta);
@@ -1704,18 +1704,18 @@ TEST_F(KVCacheMemoryConnectorTest, copyCache_ReturnTrue_H2D_SplitKvScale_NoBlock
     constexpr size_t kScaleBytesPerTok = 132;
 
     AttentionConfigs attn_config;
-    attn_config.kv_lora_rank      = 512;
-    attn_config.rope_head_dim     = 64;
-    attn_config.tokens_per_block  = kSeqPerBlock;
+    attn_config.kv_lora_rank     = 512;
+    attn_config.rope_head_dim    = 64;
+    attn_config.tokens_per_block = kSeqPerBlock;
     KVCacheSpecDesc desc;
     desc.tag        = "default";
     desc.cache_type = rtp_llm::KVCacheSpecType::MultiHeadLatentAttention;
     desc.dtype      = rtp_llm::DataType::TYPE_FP8_E4M3;
     SpecBuildContext ctx;
-    ctx.dtype                   = rtp_llm::DataType::TYPE_FP8_E4M3;
-    ctx.seq_size_per_block      = kSeqPerBlock;
-    ctx.attn_config             = &attn_config;
-    auto mla_spec               = SpecBuilder::build(desc, ctx);
+    ctx.dtype              = rtp_llm::DataType::TYPE_FP8_E4M3;
+    ctx.seq_size_per_block = kSeqPerBlock;
+    ctx.attn_config        = &attn_config;
+    auto mla_spec          = SpecBuilder::build(desc, ctx);
 
     cache_config_.layer_num             = static_cast<uint32_t>(kLayerNum);
     cache_config_.layer_all_num         = static_cast<uint32_t>(kLayerNum);
