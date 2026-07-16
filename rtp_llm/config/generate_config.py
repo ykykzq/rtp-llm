@@ -488,7 +488,11 @@ class GenerateConfig(BaseModel):
         self.stop_words_str += special_tokens.stop_words_str_list
 
     def add_thinking_params(
-        self, tokenizer, generate_env_config, normalize_response_format: bool = True
+        self,
+        tokenizer,
+        generate_env_config,
+        normalize_response_format: bool = True,
+        enable_thinking: Optional[bool] = None,
     ):
         """Add thinking parameters from generate_env_config.
 
@@ -498,11 +502,16 @@ class GenerateConfig(BaseModel):
         """
 
         end_think_token_id = generate_env_config.think_end_token_id
+        in_think_mode = (
+            bool(generate_env_config.think_mode)
+            if enable_thinking is None
+            else enable_thinking
+        )
         self.end_think_token_ids = (
             [end_think_token_id] if end_think_token_id != -1 else []
         )
         if (
-            bool(generate_env_config.think_mode)
+            in_think_mode
             and tokenizer
             and end_think_token_id == -1
         ):
@@ -513,9 +522,7 @@ class GenerateConfig(BaseModel):
                 think_end_tag, add_special_tokens=False
             )
             self.end_think_token_ids = tokenized_result
-        self.in_think_mode = (
-            bool(generate_env_config.think_mode) and len(self.end_think_token_ids) >= 0
-        )
+        self.in_think_mode = in_think_mode
         if normalize_response_format:
             self.apply_response_format(generate_env_config=generate_env_config)
 

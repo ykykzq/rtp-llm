@@ -251,4 +251,34 @@ TEST_F(QueryConverterTest, MultipleGrammarConstraintsAreRejectedByFactory) {
     }
 }
 
+TEST_F(QueryConverterTest, GrammarWithMultipleSequencesIsRejectedByFactory) {
+    struct MultiSequenceCase {
+        const char* name;
+        void (*configure)(GenerateConfigPB*);
+    };
+    const std::array<MultiSequenceCase, 3> cases{{
+        {"num_beams", [](GenerateConfigPB* config) { config->set_num_beams(2); }},
+        {"variable_num_beams", [](GenerateConfigPB* config) { config->add_variable_num_beams(2); }},
+        {"num_return_sequences", [](GenerateConfigPB* config) { config->set_num_return_sequences(2); }},
+    }};
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        GenerateInputPB input;
+        input.add_token_ids(0);
+        auto* config = input.mutable_generate_config();
+        config->mutable_regex()->set_value("[a-z]+");
+        test_case.configure(config);
+
+        auto generate_input = QueryConverter::transQuery(&input);
+        auto result = LogitsProcessorFactory::createLogitsProcessors(
+            std::move(generate_input), /*init_batch_size=*/1, /*max_batch_size=*/2, /*eos_token_id=*/0);
+
+        ASSERT_FALSE(result.ok());
+        EXPECT_EQ(result.status().code(), ErrorCode::INVALID_PARAMS);
+        EXPECT_NE(result.status().ToString().find("does not support beam search or num_return_sequences > 1"),
+                  std::string::npos);
+    }
+}
+
 }  // namespace rtp_llm

@@ -64,6 +64,11 @@ ErrorResult<GrammarKeyCpp> keyFromGenerateConfig(const GenerateConfig& config) {
 }  // namespace
 
 std::shared_ptr<XGrammarBackend>& LogitsProcessorFactory::grammarBackend() {
+    // Process-wide by design: each rank runs in its own process, and RTP-LLM
+    // constructs exactly one engine/executor per process. The backend is thus
+    // initialized once from that engine's tokenizer and shared by its streams.
+    // Do not use this factory for multiple engines with different tokenizers in
+    // one process without first moving this state to the engine/executor.
     static std::shared_ptr<XGrammarBackend> backend;
     return backend;
 }
@@ -75,12 +80,12 @@ void LogitsProcessorFactory::init(const ModelConfig&   model_config,
     PrefixToCandidateTokens::instance()->reloadPrefixDictWithPrefix(model_config.ckpt_path, tree_decode_config);
 }
 
-ErrorResult<LogitsProcessors>
+ErrorResult<std::vector<BaseLogitsProcessorPtr>>
 LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> generate_input,
                                                int32_t                        init_batch_size,
                                                int32_t                        max_batch_size,
                                                int64_t                        eos_token_id) {
-    LogitsProcessors result;
+    std::vector<BaseLogitsProcessorPtr> result;
 
     auto& config = *generate_input->generate_config;
 
@@ -90,6 +95,8 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     }
     GrammarKeyCpp grammar_key = std::move(grammar_key_result.value());
 
+    // Thinking constraints reach the execution layer as normalized grammar.
+    // Thinking-only configs are not supported here; do not add a legacy processor fallback.
     if (!grammar_key.empty()) {
         if (config.hasNumBeams() || config.num_return_sequences > 1) {
             return ErrorInfo(ErrorCode::INVALID_PARAMS,
@@ -118,25 +125,22 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
         }
         auto grammar_processor =
             std::make_shared<GrammarLogitsProcessor>(std::move(matcher_or.value()), eos_token_id);
-        result.add(grammar_processor,
-                   /*score_batch=*/nullptr,
-                   /*spec=*/grammar_processor,
-                   /*stateful=*/grammar_processor);
+        result.push_back(std::move(grammar_processor));
     }
 
     auto tree_processor = TreeLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);
     if (tree_processor != nullptr) {
-        result.add(tree_processor);
+        result.push_back(std::move(tree_processor));
     }
 
     auto rec_processor = RecommendationLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);
     if (rec_processor != nullptr) {
-        result.add(rec_processor);
+        result.push_back(std::move(rec_processor));
     }
 
     auto multi_seq_processor = MultiSeqLogitsProcessor::fromGenerateInput(generate_input, eos_token_id);
     if (multi_seq_processor != nullptr) {
-        result.add(multi_seq_processor);
+        result.push_back(std::move(multi_seq_processor));
     }
 
     return std::move(result);

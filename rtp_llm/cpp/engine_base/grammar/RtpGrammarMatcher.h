@@ -49,6 +49,9 @@ public:
 private:
     std::shared_ptr<xgrammar::CompiledGrammar> compiled_;
     std::unique_ptr<xgrammar::GrammarMatcher>  matcher_;
+    std::optional<std::vector<int32_t>>         override_stop_tokens_;
+    bool                                         terminate_without_stop_token_ = false;
+    int                                          max_rollback_tokens_          = 200;
 
     int64_t num_accepted_ = 0;
     bool    finished_     = false;

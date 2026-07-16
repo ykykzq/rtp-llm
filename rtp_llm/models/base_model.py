@@ -308,6 +308,11 @@ class BaseModel(object):
             self.model_config.special_tokens.eos_token_id = int(eos_token_id)
 
     def _fill_grammar_tokenizer_info(self) -> None:
+        # Grammar tokenizer metadata is a startup-time compatibility contract, not
+        # an optional per-request optimization.  Fail fast below if it cannot be
+        # built: accepting ordinary requests with empty metadata would defer an
+        # unsupported tokenizer or missing stop-token configuration until the
+        # first grammar request reaches the engine.
         if self.model_config.tokenizer_info_json:
             return
 

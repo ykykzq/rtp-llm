@@ -169,16 +169,6 @@ class ResponseFormatBuilder:
                 "only one grammar constraint (json_schema / regex / ebnf / "
                 "structural_tag) may be set per request",
             )
-        # NormalOutputDispatcher skips per-token matcher advance under beam search, causing schema-illegal tokens.
-        if constraints and (
-            self.config.has_num_beams() or self.config.num_return_sequences > 1
-        ):
-            raise FtRuntimeException(
-                ExceptionType.UNSUPPORTED_OPERATION,
-                "grammar-constrained decoding (json_schema / regex / ebnf / "
-                "structural_tag) is not supported with beam search "
-                "(num_beams > 1 or num_return_sequences > 1)",
-            )
 
     def _existing_reasoning_envelope_final_format(self) -> Optional[Dict[str, Any]]:
         """Return final output format if structural_tag is already reasoning-wrapped."""

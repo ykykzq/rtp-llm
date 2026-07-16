@@ -20,6 +20,7 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
+#include "rtp_llm/cpp/models/logits_processor/SpecLogitsProcessor.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -259,12 +260,26 @@ private:
     TestDataHolder<SamplerOutput> output_holder;
 };
 
-class FakeGrammarSpecLogitsProcessor: public SpecLogitsProcessor {
+class FakeGrammarSpecLogitsProcessor: public BaseLogitsProcessor {
 public:
     FakeGrammarSpecLogitsProcessor(std::vector<std::vector<int32_t>> allowed_tokens_by_row, int cap):
         allowed_tokens_by_row_(std::move(allowed_tokens_by_row)), cap_(cap) {}
 
-    ErrorResult<int> tryAcceptAndFillBitmask(const SpecLogitsProcessorRequest& request) override {
+    std::optional<ErrorInfo> process(const SamplerInputs&, size_t, size_t) override {
+        return std::nullopt;
+    }
+
+    void updateMultiSeqStatus(const std::vector<int>&) override {}
+
+    std::optional<ErrorInfo> updateStatus(const torch::Tensor&, int32_t) override {
+        return std::nullopt;
+    }
+
+    MtpProcessorCapability mtpCapability() const override {
+        return {MtpProcessorMode::SPEC_VERIFY, {}};
+    }
+
+    ErrorResult<int> prepareSpeculative(const SpecLogitsProcessorRequest& request) override {
         observed_draft_tokens.assign(request.draft_tokens, request.draft_tokens + request.propose_step);
         for (int row = 0; row <= request.propose_step; ++row) {
             auto* row_bits = request.bitmask_cpu_out + static_cast<size_t>(row) * request.bitmask_size_int32;
@@ -295,7 +310,6 @@ public:
     std::optional<ErrorInfo> updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens) override {
         return std::nullopt;
     }
-
 };
 
 class TestableMtpExecutor: public MtpExecutor {
@@ -509,10 +523,19 @@ public:
     }
 };
 
-bool specMaskAllows(const torch::Tensor& mask, int64_t row, int64_t token) {
-    auto        mask_cpu = mask.cpu().contiguous();
-    const auto* data     = mask_cpu.data_ptr<bool>();
-    return !data[row * mask_cpu.size(1) + token];
+bool specMaskAllows(const SpecLogitsVerifyRunner::LaunchResult& result, int64_t logits_row, int64_t token) {
+    auto        indices    = result.logits_row_indices_cpu_lifetime.contiguous();
+    auto        masks      = result.packed_allow_mask_cpu_lifetime.contiguous();
+    const auto* index_data = indices.data_ptr<int32_t>();
+    const auto* mask_data  = masks.data_ptr<int32_t>();
+    for (int64_t compact_row = 0; compact_row < indices.numel(); ++compact_row) {
+        if (index_data[compact_row] != logits_row) {
+            continue;
+        }
+        const uint32_t word = static_cast<uint32_t>(mask_data[compact_row * masks.size(1) + token / 32]);
+        return (word & (1u << (token % 32))) != 0u;
+    }
+    return true;
 }
 
 TEST_F(MtpExecutorTest, testSpecLogitsVerifyRunnerMergesGrammarMasksAndCaps) {
@@ -542,24 +565,59 @@ TEST_F(MtpExecutorTest, testSpecLogitsVerifyRunnerMergesGrammarMasksAndCaps) {
     auto                   result = runner.run(task);
 
     ASSERT_TRUE(result.has_active_processor);
-    ASSERT_TRUE(result.spec_vocab_mask_cpu_lifetime.defined());
+    ASSERT_TRUE(result.packed_allow_mask_cpu_lifetime.defined());
+    ASSERT_TRUE(result.logits_row_indices_cpu_lifetime.defined());
     EXPECT_EQ(proc_a->observed_draft_tokens, (std::vector<int32_t>{11, 12}));
     EXPECT_EQ(proc_c->observed_draft_tokens, (std::vector<int32_t>{21, 22}));
     EXPECT_EQ(toVec<int32_t>(result.spec_cap_cpu), (std::vector<int32_t>{1, propose_step}));
+    EXPECT_EQ(toVec<int32_t>(result.logits_row_indices_cpu_lifetime), (std::vector<int32_t>{0, 1, 2, 3, 4, 5}));
 
-    const auto& mask = result.spec_vocab_mask_cpu_lifetime;
-    EXPECT_FALSE(specMaskAllows(mask, 0, 1));
-    EXPECT_TRUE(specMaskAllows(mask, 0, 2));
-    EXPECT_FALSE(specMaskAllows(mask, 0, 3));
-    EXPECT_TRUE(specMaskAllows(mask, 1, 2));
-    EXPECT_FALSE(specMaskAllows(mask, 1, 3));
-    EXPECT_FALSE(specMaskAllows(mask, 2, 0));
-    EXPECT_TRUE(specMaskAllows(mask, 2, 3));
+    EXPECT_FALSE(specMaskAllows(result, 0, 1));
+    EXPECT_TRUE(specMaskAllows(result, 0, 2));
+    EXPECT_FALSE(specMaskAllows(result, 0, 3));
+    EXPECT_TRUE(specMaskAllows(result, 1, 2));
+    EXPECT_FALSE(specMaskAllows(result, 1, 3));
+    EXPECT_FALSE(specMaskAllows(result, 2, 0));
+    EXPECT_TRUE(specMaskAllows(result, 2, 3));
 
-    EXPECT_TRUE(specMaskAllows(mask, 3, 0));
-    EXPECT_FALSE(specMaskAllows(mask, 3, 1));
-    EXPECT_TRUE(specMaskAllows(mask, 4, 1));
-    EXPECT_TRUE(specMaskAllows(mask, 5, 2));
+    EXPECT_TRUE(specMaskAllows(result, 3, 0));
+    EXPECT_FALSE(specMaskAllows(result, 3, 1));
+    EXPECT_TRUE(specMaskAllows(result, 4, 1));
+    EXPECT_TRUE(specMaskAllows(result, 5, 2));
+}
+
+TEST_F(MtpExecutorTest, testSpecLogitsVerifyRunnerAllocatesOnlyActiveStreamRows) {
+    const size_t batch_size   = 4;
+    const int    propose_step = 2;
+    const size_t vocab_size   = 65;
+
+    auto proc = std::make_shared<FakeGrammarSpecLogitsProcessor>(std::vector<std::vector<int32_t>>{{1}, {2}, {64}},
+                                                                 /*cap=*/propose_step);
+
+    SpecLogitsVerifyRunner::LaunchTask task;
+    task.total_streams = batch_size;
+    task.propose_step  = propose_step;
+    task.vocab_size    = vocab_size;
+    task.draft_tokens  = torch::tensor({10, 11, 20, 21, 30, 31, 40, 41}, torch::kInt32).reshape({4, 2});
+    task.active        = {{proc, 3}};
+
+    SpecLogitsVerifyRunner runner;
+    auto                   result = runner.run(task);
+
+    ASSERT_TRUE(result.has_active_processor);
+    ASSERT_EQ(result.packed_allow_mask_cpu_lifetime.dim(), 2);
+    EXPECT_EQ(result.packed_allow_mask_cpu_lifetime.size(0), 3);
+    EXPECT_EQ(result.packed_allow_mask_cpu_lifetime.size(1), 3);
+    ASSERT_EQ(result.packed_allow_mask_gpu.dim(), 2);
+    EXPECT_EQ(result.packed_allow_mask_gpu.size(0), 3);
+    EXPECT_EQ(result.packed_allow_mask_gpu.size(1), 3);
+    EXPECT_EQ(result.logits_row_indices_gpu.numel(), 3);
+    EXPECT_EQ(toVec<int32_t>(result.logits_row_indices_cpu_lifetime), (std::vector<int32_t>{9, 10, 11}));
+    EXPECT_EQ(toVec<int32_t>(result.spec_cap_cpu), (std::vector<int32_t>{2, 2, 2, 2}));
+    EXPECT_TRUE(specMaskAllows(result, 0, 0));
+    EXPECT_TRUE(specMaskAllows(result, 9, 1));
+    EXPECT_FALSE(specMaskAllows(result, 9, 2));
+    EXPECT_TRUE(specMaskAllows(result, 11, 64));
 }
 
 TEST_F(MtpExecutorTest, testSpecLogitsVerifyRunnerRejectsUnexpectedDraftColumns) {
@@ -605,7 +663,8 @@ TEST_F(MtpExecutorTest, testPrepareStreamsRejectsNormalDecodeOnlyProcessor) {
     ASSERT_TRUE(stream->hasError());
     auto error = stream->statusInfo();
     EXPECT_EQ(error.code(), ErrorCode::INVALID_PARAMS);
-    EXPECT_NE(error.ToString().find("normal-decode-only logits processor"), std::string::npos);
+    EXPECT_NE(error.ToString().find("processor_index=0"), std::string::npos);
+    EXPECT_NE(error.ToString().find("processor supports normal decoding only"), std::string::npos);
 }
 
 TEST_F(MtpExecutorTest, testSingleBatchPrefill) {

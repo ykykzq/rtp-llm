@@ -17,17 +17,6 @@ struct SpecLogitsProcessorRequest {
     int32_t* bitmask_cpu_out    = nullptr;
     size_t   bitmask_size_int32 = 0;
     size_t   vocab_size         = 0;
-};
-
-// Optional facet implemented by BaseLogitsProcessor subclasses that can preview
-// speculative draft tokens without mutating their committed state.
-class SpecLogitsProcessor {
-public:
-    virtual ~SpecLogitsProcessor() = default;
-
-    // Returns accept cap in [0, propose_step]. Implementations must restore their
-    // committed state before returning; business failures come back as ErrorInfo.
-    virtual ErrorResult<int> tryAcceptAndFillBitmask(const SpecLogitsProcessorRequest& request) = 0;
 
     static size_t bitmaskWordCount(size_t vocab_size) {
         return (vocab_size + 31) / 32;
@@ -35,7 +24,5 @@ public:
 
     static constexpr int32_t kBitmaskAllowAll = -1;
 };
-
-using SpecLogitsProcessorPtr = std::shared_ptr<SpecLogitsProcessor>;
 
 }  // namespace rtp_llm

@@ -242,13 +242,15 @@ class OpenaiEndpoint(object):
         if request.response_format is not None:
             config.response_format = request.response_format
         reasoning_format = self.chat_renderer.get_reasoning_format()
+        enable_thinking = request.get_enable_thinking(
+            default=bool(self.generate_env_config.think_mode)
+        )
         config.add_thinking_params(
             self.tokenizer,
             self.generate_env_config,
             normalize_response_format=False,
+            enable_thinking=enable_thinking,
         )
-        if request.disable_thinking():
-            config.in_think_mode = False
         config.validate()
         config.apply_response_format(reasoning_format=reasoning_format)
         if request.debug_info:

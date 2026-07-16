@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
 #include "rtp_llm/cpp/models/position_ids/PositionIdsGenerator.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/utils/AssertUtils.h"
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -39,7 +40,7 @@ struct StreamUpdateInfo {
     bool                force_update_info      = false;
     // prompt scoring
     std::optional<PromptLogitsOutput> prompt_logits;
-    std::optional<ErrorInfo> error_info;
+    std::optional<ErrorInfo>          error_info;
 };
 
 struct StreamSpecUpdateInfo {
@@ -50,8 +51,8 @@ struct StreamSpecUpdateInfo {
     const torch::Tensor draft_hidden_states;
     const torch::Tensor draft_token_probs;
 
-    bool update_remote_generate = true;
-    bool force_update_info      = false;
+    bool                     update_remote_generate = true;
+    bool                     force_update_info      = false;
     std::optional<ErrorInfo> error_info;
 };
 
@@ -452,21 +453,12 @@ public:
     }
 
     const std::vector<BaseLogitsProcessorPtr>& getAllLogitsProcessorPtr() const {
-        return logits_processors_.normalProcessors();
-    }
-
-    const LogitsProcessors& logitsProcessors() const {
         return logits_processors_;
     }
 
-    // Processor capabilities are normally installed by LogitsProcessorFactory
-    // during stream construction. This explicit hook also supports embedders and
-    // tests without exposing the plan's internal typed lists.
-    void installLogitsProcessor(BaseLogitsProcessorPtr               normal,
-                                ScoreBatchLogitsProcessorPtr         score_batch = nullptr,
-                                std::shared_ptr<SpecLogitsProcessor> spec        = nullptr,
-                                StatefulLogitsProcessorPtr           stateful    = nullptr) {
-        logits_processors_.add(std::move(normal), std::move(score_batch), std::move(spec), std::move(stateful));
+    void installLogitsProcessor(BaseLogitsProcessorPtr processor) {
+        RTP_LLM_CHECK_WITH_INFO(processor != nullptr, "logits processor must not be null");
+        logits_processors_.push_back(std::move(processor));
     }
 
     at::Generator getGenerator() {
@@ -557,13 +549,13 @@ public:
 
 protected:
     int  estimateKVNeedBlocks(int remaining_tokens, int target_batch_size) const;
-    bool    reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
-    std::optional<ErrorInfo> commitStatefulTokens(const torch::Tensor& new_tokens, int32_t num_new_tokens);
-    void    updateLogitProcessorMultiSeqStatus(const torch::Tensor& src_batch_indices);
-    std::optional<ErrorInfo> updateLogitProcessorStatus(const StreamUpdateInfo& update_info);
-    std::optional<ErrorInfo> validateStatefulLogitsProcessorState();
-    void fillSubGenerateStatus(StreamState state);
-    void resizeSubGenerateStatus(size_t new_size);
+    bool                     reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
+    std::optional<ErrorInfo> updateNormalLogitProcessorStatus(const StreamUpdateInfo& update_info);
+    std::optional<ErrorInfo> updateLogitProcessorStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens);
+    void                     updateLogitProcessorMultiSeqStatus(const torch::Tensor& src_batch_indices);
+    std::optional<ErrorInfo> validateLogitsProcessorState();
+    void                     fillSubGenerateStatus(StreamState state);
+    void                     resizeSubGenerateStatus(size_t new_size);
 
     void reportStreamMetrics();
     void reportCacheReuseMetrics() const;
@@ -657,8 +649,8 @@ protected:
     rtp_llm::DataType dtype_;
     size_t            hidden_size_;
 
-    LogitsProcessors logits_processors_;
-    at::Generator    generator_;
+    std::vector<BaseLogitsProcessorPtr> logits_processors_;
+    at::Generator                       generator_;
 
     // just for bool test
     bool perf_test_ = false;

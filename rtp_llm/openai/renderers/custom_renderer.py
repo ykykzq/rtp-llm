@@ -1014,7 +1014,7 @@ class CustomChatRenderer:
         return [StreamStatus(request) for _ in range(n)]
 
     def in_think_mode(self, request: ChatCompletionRequest):
-        return self.think_mode
+        return request.get_enable_thinking(default=bool(self.think_mode))
 
     def should_process_think(self, request: ChatCompletionRequest):
         # 留出方法给子类重写, 避免重复的think处理

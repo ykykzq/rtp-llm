@@ -13,9 +13,7 @@ namespace rtp_llm {
 std::optional<ErrorInfo> collectStreamSamplerError(const SamplerOutput& sampler_output,
                                                    const torch::Tensor& success_cpu,
                                                    int                  batch_idx_in,
-                                                   int                  batch_idx_out,
-                                                   int                  cur_batch_size,
-                                                   int                  next_batch_size) {
+                                                   int                  cur_batch_size) {
     std::optional<ErrorInfo> error_info;
     const auto               set_first_error = [&error_info](const ErrorInfo& error) {
         if (!error_info.has_value()) {
@@ -23,8 +21,10 @@ std::optional<ErrorInfo> collectStreamSamplerError(const SamplerOutput& sampler_
         }
     };
 
-    for (int i = 0; i < next_batch_size; ++i) {
-        const size_t error_idx = static_cast<size_t>(batch_idx_out + i);
+    // Processor errors and sampling success both use sampler-input coordinates;
+    // output coordinates can diverge when beam search changes the batch size.
+    for (int i = 0; i < cur_batch_size; ++i) {
+        const size_t error_idx = static_cast<size_t>(batch_idx_in + i);
         if (error_idx < sampler_output.processor_errors.size()
             && sampler_output.processor_errors[error_idx].has_value()) {
             set_first_error(sampler_output.processor_errors[error_idx].value());
@@ -234,8 +234,7 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
         }
     }
 
-    auto error_info = collectStreamSamplerError(
-        sampler_output, success_cpu, batch_idx_in, batch_idx_out, cur_batch_size, next_batch_size);
+    auto error_info = collectStreamSamplerError(sampler_output, success_cpu, batch_idx_in, cur_batch_size);
 
     RTP_LLM_LOG_DEBUG("stream [%ld], new_tokens size = [%ld]", stream->streamId(), new_tokens.numel());
 

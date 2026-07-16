@@ -20,11 +20,11 @@ public:
                      const GrammarConfig& grammar_config,
                      const std::string&   tree_decode_config);
 
-    static ErrorResult<LogitsProcessors>
+    static ErrorResult<std::vector<BaseLogitsProcessorPtr>>
     createLogitsProcessors(std::shared_ptr<GenerateInput> generate_input,
-                           int32_t init_batch_size,
-                           int32_t max_batch_size,
-                           int64_t eos_token_id);
+                           int32_t                        init_batch_size,
+                           int32_t                        max_batch_size,
+                           int64_t                        eos_token_id);
 
 private:
     static std::shared_ptr<XGrammarBackend>& grammarBackend();

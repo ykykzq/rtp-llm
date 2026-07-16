@@ -33,8 +33,8 @@ NormalBatchStreamProcessor::NormalBatchStreamProcessor(
         model_input_gatherer_config_.layer_to_kv_cache_group_id.push_back(group_ids.empty() ? 0 : group_ids.front());
     }
     model_input_gatherer_config_.kv_cache_group_types = cache_config.groupTypesSnapshot();
-    model_input_gatherer_config_.warm_up                    = warm_up;
-    model_input_gatherer_config_.enable_detail_log          = profiling_debug_logging_config.enable_detail_log;
+    model_input_gatherer_config_.warm_up              = warm_up;
+    model_input_gatherer_config_.enable_detail_log    = profiling_debug_logging_config.enable_detail_log;
 
     model_input_gatherer_   = std::make_unique<NormalModelInputGatherer>(model_input_gatherer_config_);
     sampler_input_gatherer_ = std::make_unique<NormalSamplerInputGatherer>();
@@ -68,12 +68,6 @@ void NormalBatchStreamProcessor::fillSamplerCommonInputs(SamplerInputs&         
                                                          bool                          score_batch,
                                                          size_t                        propose_step) const {
     sampler_input_gatherer_->fillSamplerCommonInputs(sampler_inputs, all_streams, score_batch, propose_step);
-}
-
-void NormalBatchStreamProcessor::setLogitsProcessorInputs(SamplerInputs&                sampler_inputs,
-                                                          std::list<GenerateStreamPtr>& all_streams,
-                                                          bool                          score_batch) const {
-    sampler_input_gatherer_->setLogitsProcessorInputs(sampler_inputs, all_streams, score_batch);
 }
 
 }  // namespace rtp_llm

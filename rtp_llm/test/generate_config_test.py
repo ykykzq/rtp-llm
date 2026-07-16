@@ -511,8 +511,8 @@ class OpenaiGenerateConfigTest(TestCase):
         )
 
 
-class GrammarBeamSearchRejectionTest(TestCase):
-    """ResponseFormatBuilder must reject beam search + grammar-constrained decoding."""
+class GrammarMultiSequenceConfigTest(TestCase):
+    """Frontend normalization preserves fields; backend owns capability validation."""
 
     def _apply(self, **fields):
         cfg = GenerateConfig(**fields)
@@ -527,7 +527,7 @@ class GrammarBeamSearchRejectionTest(TestCase):
             ResponseFormatBuilder(cfg).apply()
         self.assertEqual(ctx.exception.exception_type, exception_type)
 
-    def test_grammar_field_plus_beam_rejected(self):
+    def test_grammar_field_plus_multi_sequence_is_preserved(self):
         cases = [
             {"json_schema": '{"type": "object"}', "num_beams": 4},
             {
@@ -541,7 +541,13 @@ class GrammarBeamSearchRejectionTest(TestCase):
         ]
         for fields in cases:
             with self.subTest(fields=fields):
-                self._assert_rejected(ExceptionType.UNSUPPORTED_OPERATION, **fields)
+                cfg = self._apply(**fields)
+                self.assertTrue(
+                    any(
+                        getattr(cfg, field) is not None
+                        for field in ("json_schema", "regex", "ebnf", "structural_tag")
+                    )
+                )
 
     def test_grammar_or_beam_alone_allowed(self):
         for fields in [
@@ -749,7 +755,6 @@ class RawUpdateAndGrammarConflictTest(TestCase):
             grammar_terminate_without_stop_token=True,
         )
         self.assertFalse(self._terminate_without_stop_token(cfg))
-        self.assertFalse(hasattr(cfg, "grammar_terminate_without_stop_token"))
         self.assertNotIn(
             "grammar_terminate_without_stop_token", GenerateConfig.model_fields
         )

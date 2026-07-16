@@ -774,6 +774,16 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
         return;
     }
 
+    int nxt_cached_len   = seqLength() - 1;
+    int accept_token_num = nxt_cached_len - cur_cached_len;
+
+    // The stream token history is authoritative. Advance every processor exactly
+    // once before mutating speculative buffers, cache layout or published output.
+    if (auto error = updateLogitProcessorStatus(new_tokens, accept_token_num); error.has_value()) {
+        reportEventWithoutLock(StreamEvents::Error, error->code(), error->ToString());
+        return;
+    }
+
     // update speculative output buffer
     int  target_last_token = new_tokens.data_ptr<int>()[num_new_tokens - 1];
     int* spec_tokens       = sp_output_buffer_->tokens.data_ptr<int>();
@@ -785,8 +795,6 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     sp_output_buffer_->all_probs     = update_info.draft_token_probs;
 
     // for spec-decode linear attention, we need to adjust cache blocks
-    int nxt_cached_len   = seqLength() - 1;
-    int accept_token_num = nxt_cached_len - cur_cached_len;
     if (accept_token_num > 1 && stream_cache_resource_) {
         int seq_size_per_block = seqSizePerBlock();
 
@@ -811,12 +819,6 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     } else {
         RTP_LLM_LOG_DEBUG(
             "[stream %d (%d -> %d)] no swap cache blocks", streamId(), cur_cached_len + 1, nxt_cached_len + 1);
-    }
-
-    // Commit accepted tokens to grammar/stateful processors before the next spec verify mask is built.
-    if (auto error = commitStatefulTokens(new_tokens, accept_token_num); error.has_value()) {
-        reportEventWithoutLock(StreamEvents::Error, error->code(), error->ToString());
-        return;
     }
 
     // update normal output buffer
@@ -867,19 +869,19 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
 
     resizeSubGenerateStatus(update_info.new_tokens.size(0));
 
+    // Update processor state before publishing output, including the batch that
+    // finishes the stream, so normal and speculative decoding share one lifecycle.
+    if (auto error = updateNormalLogitProcessorStatus(update_info); error.has_value()) {
+        reportEventWithoutLock(StreamEvents::Error, error->code(), error->ToString());
+        return;
+    }
+
     // TODO(xinfei.sxf) fix this (update_queue)
     updateOutput(update_info);
 
     // checkFinished() 已将本轮 updateOutput 中上报的 GenerateDone/Error 事件应用到状态上，
     // 即使 moveToNext() 还未被调度器轮询，这里也能拿到与事件一致的"已完成"判断。
     bool is_done = generate_status_->checkFinished();
-
-    if (!is_done) {
-        if (auto error = updateLogitProcessorStatus(update_info); error.has_value()) {
-            reportEventWithoutLock(StreamEvents::Error, error->code(), error->ToString());
-            return;
-        }
-    }
 
     if (!is_done || stream_cache_resource_->reuseCache()) {
         // kv cache blocks must be updated if REUSE_CACHE is on, even the stream is done
@@ -911,18 +913,25 @@ bool GenerateStream::updateKvCacheBlocks(const torch::Tensor& src_batch_indices)
     return stream_cache_resource_->updateKVBlock(block_src_batch, is_seq_len_misaligned);
 }
 
-std::optional<ErrorInfo> GenerateStream::commitStatefulTokens(const torch::Tensor& new_tokens,
-                                                              int32_t              num_new_tokens) {
+std::optional<ErrorInfo> GenerateStream::updateNormalLogitProcessorStatus(const StreamUpdateInfo& update_info) {
+    updateLogitProcessorMultiSeqStatus(update_info.src_batch_indices);
+    RTP_LLM_CHECK(update_info.new_tokens.size(0) == currentBatchSize());
+    return updateLogitProcessorStatus(update_info.new_tokens, update_info.num_new_tokens);
+}
+
+std::optional<ErrorInfo> GenerateStream::updateLogitProcessorStatus(const torch::Tensor& new_tokens,
+                                                                     int32_t              num_new_tokens) {
+    RTP_LLM_PROFILE_FUNCTION();
     if (num_new_tokens <= 0) {
         return std::nullopt;
     }
-    for (const auto& logit_processor_ptr : logits_processors_.statefulProcessors()) {
-        auto error = logit_processor_ptr->commitTokens(new_tokens, num_new_tokens);
+    for (const auto& logit_processor_ptr : logits_processors_) {
+        auto error = logit_processor_ptr->updateStatus(new_tokens, num_new_tokens);
         if (error.has_value()) {
             return error;
         }
     }
-    return validateStatefulLogitsProcessorState();
+    return validateLogitsProcessorState();
 }
 
 void GenerateStream::updateLogitProcessorMultiSeqStatus(const torch::Tensor& src_batch_indices) {
@@ -935,42 +944,25 @@ void GenerateStream::updateLogitProcessorMultiSeqStatus(const torch::Tensor& src
     std::vector<int> src_batch_indices_vec(data, data + src_batch_indices.numel());
     RTP_LLM_CHECK(src_batch_indices_vec.size() == currentBatchSize());
 
-    for (const auto& logit_processor_ptr : logits_processors_.normalProcessors()) {
+    for (const auto& logit_processor_ptr : logits_processors_) {
         logit_processor_ptr->updateMultiSeqStatus(src_batch_indices_vec);
     }
 }
 
-std::optional<ErrorInfo> GenerateStream::updateLogitProcessorStatus(const StreamUpdateInfo& update_info) {
-    RTP_LLM_PROFILE_FUNCTION();
-    updateLogitProcessorMultiSeqStatus(update_info.src_batch_indices);
-
-    const auto& new_tokens = update_info.new_tokens;
-    RTP_LLM_CHECK(new_tokens.size(0) == currentBatchSize());
-    auto num_new_tokens = update_info.num_new_tokens;
-
-    for (const auto& logit_processor_ptr : logits_processors_.normalProcessors()) {
-        auto error = logit_processor_ptr->updateStatus(new_tokens, num_new_tokens);
-        if (error.has_value()) {
-            return error;
-        }
-    }
-    return validateStatefulLogitsProcessorState();
-}
-
-std::optional<ErrorInfo> GenerateStream::validateStatefulLogitsProcessorState() {
+std::optional<ErrorInfo> GenerateStream::validateLogitsProcessorState() {
     if (hasError()) {
         return std::nullopt;
     }
 
-    const auto stream_output_len = static_cast<int64_t>(outputTokenLen());
-    const auto& stateful_processors = logits_processors_.statefulProcessors();
-    for (size_t i = 0; i < stateful_processors.size(); ++i) {
-        const auto& processor = stateful_processors[i];
-        const auto processor_output_len = processor->committedOutputLen();
-        if (processor_output_len != stream_output_len) {
+    const auto  stream_output_len = static_cast<int64_t>(outputTokenLen());
+    const auto& processors        = logits_processors_;
+    for (size_t i = 0; i < processors.size(); ++i) {
+        const auto& processor            = processors[i];
+        const auto  processor_output_len = processor->committedOutputLen();
+        if (processor_output_len.has_value() && processor_output_len.value() != stream_output_len) {
             return ErrorInfo(ErrorCode::UNKNOWN_ERROR,
-                             "stateful logits processor committed output length mismatch: processor_index="
-                                 + std::to_string(i) + ", processor=" + std::to_string(processor_output_len)
+                             "logits processor committed output length mismatch: processor_index=" + std::to_string(i)
+                                 + ", processor=" + std::to_string(processor_output_len.value())
                                  + ", stream_output=" + std::to_string(stream_output_len));
         }
     }

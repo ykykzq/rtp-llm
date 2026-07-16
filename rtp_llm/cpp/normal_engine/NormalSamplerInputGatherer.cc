@@ -198,36 +198,18 @@ void NormalSamplerInputGatherer::fillSamplerCommonInputs(SamplerInputs&         
     }
 }
 
-void NormalSamplerInputGatherer::insertScoreBatchProcessor(LogitsProcessorStatesPtr&            state_ptr,
-                                                           const ScoreBatchLogitsProcessorPtr& processor,
-                                                           size_t                               idx,
-                                                           int                                  score_len) {
-    state_ptr->insert(processor, idx, idx + static_cast<size_t>(score_len));
-}
-
 void NormalSamplerInputGatherer::setLogitsProcessorInputs(SamplerInputs&                sampler_inputs,
-                                                          std::list<GenerateStreamPtr>& all_streams,
-                                                          bool                          score_batch) const {
+                                                          std::list<GenerateStreamPtr>& all_streams) const {
     LogitsProcessorStatesPtr state_ptr = std::make_shared<LogitsProcessorStates>();
     size_t                   idx       = 0;
     for (auto& stream : all_streams) {
-        if (score_batch) {
-            const int score_len = static_cast<int>(stream->scoreLen());
-            for (const auto& processor : stream->logitsProcessors().scoreBatchProcessors()) {
-                if (processor) {
-                    NormalSamplerInputGatherer::insertScoreBatchProcessor(state_ptr, processor, idx, score_len);
-                }
+        const size_t batch_size = stream->currentBatchSize();
+        for (const auto& processor : stream->getAllLogitsProcessorPtr()) {
+            if (processor) {
+                state_ptr->insert(processor, idx, idx + batch_size);
             }
-            idx += static_cast<size_t>(score_len);
-        } else {
-            const size_t batch_size = stream->currentBatchSize();
-            for (const auto& processor : stream->logitsProcessors().normalProcessors()) {
-                if (processor) {
-                    state_ptr->insert(processor, idx, idx + batch_size);
-                }
-            }
-            idx += batch_size;
         }
+        idx += batch_size;
     }
     sampler_inputs.logits_processor_states_ptr = state_ptr;
 }

@@ -1,15 +1,12 @@
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsVerifyRunner.h"
 
 #include <algorithm>
+#include <limits>
 
-#include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
-#include "rtp_llm/cpp/models/logits_processor/BitmaskUtils.h"
+#include "rtp_llm/cpp/models/logits_processor/SpecLogitsProcessor.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
-#if USING_CUDA
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#endif
+#include "rtp_llm/models_py/bindings/core/ExecOps.h"
 
 namespace rtp_llm {
 
@@ -17,7 +14,7 @@ namespace {
 
 void fillAllAllowBitmask(const torch::Tensor& tensor) {
     if (tensor.defined() && tensor.numel() > 0) {
-        std::fill_n(tensor.data_ptr<int32_t>(), tensor.numel(), SpecLogitsProcessor::kBitmaskAllowAll);
+        std::fill_n(tensor.data_ptr<int32_t>(), tensor.numel(), SpecLogitsProcessorRequest::kBitmaskAllowAll);
     }
 }
 
@@ -32,82 +29,72 @@ bool has1DCapacity(const torch::Tensor& tensor, int64_t size) {
 }
 
 bool has2DCapacity(const torch::Tensor& tensor, int64_t rows, int64_t cols) {
-    return tensor.defined() && tensor.dim() == 2 && tensor.size(0) >= rows && tensor.size(1) >= cols;
-}
-
-void appendUniqueRow(std::vector<size_t>& rows, size_t row) {
-    if (std::find(rows.begin(), rows.end(), row) == rows.end()) {
-        rows.push_back(row);
-    }
+    return tensor.defined() && tensor.dim() == 2 && tensor.size(0) >= rows && tensor.size(1) == cols;
 }
 
 }  // namespace
 
-void SpecLogitsVerifyRunner::applyMaskToLogits(const torch::Tensor& logits,
-                                               const torch::Tensor& spec_vocab_mask_gpu,
+void SpecLogitsVerifyRunner::applyMaskToLogits(torch::Tensor&       logits,
+                                               const torch::Tensor& packed_allow_mask_gpu,
+                                               const torch::Tensor& logits_row_indices_gpu,
                                                size_t               vocab_size) {
-    if (!spec_vocab_mask_gpu.defined()) {
+    if (!packed_allow_mask_gpu.defined()) {
         return;
     }
-
-    RTP_LLM_CHECK_WITH_INFO(spec_vocab_mask_gpu.device() == logits.device(),
-                            "MTP verify spec mask device (%s) must match logits device (%s)",
-                            spec_vocab_mask_gpu.device().str().c_str(),
-                            logits.device().str().c_str());
-    RTP_LLM_CHECK_WITH_INFO(logits.size(1) >= static_cast<int64_t>(vocab_size),
-                            "MTP verify logits vocab dim (%lld) < vocab_size=%lld",
-                            static_cast<long long>(logits.size(1)),
-                            static_cast<long long>(vocab_size));
-#if USING_CUDA
-    // Spec mask was allocated on a copy stream; pin it to the compute stream.
-    if (spec_vocab_mask_gpu.is_cuda()) {
-        c10::cuda::CUDACachingAllocator::recordStream(
-            spec_vocab_mask_gpu.storage().data_ptr(),
-            at::cuda::getCurrentCUDAStream(spec_vocab_mask_gpu.device().index()));
-    }
-#endif
-    const int64_t V = static_cast<int64_t>(vocab_size);
-    logits.narrow(1, 0, V).masked_fill_(spec_vocab_mask_gpu.narrow(1, 0, V), BaseLogitsProcessor::neg_inf);
+    runtimeApplyPackedMaskLogits(logits, packed_allow_mask_gpu, logits_row_indices_gpu, vocab_size);
 }
 
-void SpecLogitsVerifyRunner::ensureBuffersFit(size_t total_streams,
-                                              int    propose_step,
-                                              size_t vocab_size,
-                                              size_t bitmask_words) {
-    const int64_t B    = static_cast<int64_t>(total_streams);
-    const int64_t P    = static_cast<int64_t>(propose_step);
-    const int64_t rows = B * (P + 1);
-    const int64_t V    = static_cast<int64_t>(vocab_size);
-    const int64_t W    = static_cast<int64_t>(bitmask_words);
+SpecLogitsVerifyRunner::ActiveStreamLayout
+SpecLogitsVerifyRunner::buildActiveStreamLayout(const LaunchTask& task) const {
+    ActiveStreamLayout layout;
+    layout.compact_slot_by_stream.assign(task.total_streams, -1);
+    layout.stream_indices.reserve(task.active.size());
 
-    auto cpu_i32     = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-    auto pinned_i32  = cpu_i32.pinned_memory(true);
-    auto pinned_bool = torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(true);
+    for (const auto& item : task.active) {
+        RTP_LLM_CHECK_WITH_INFO(item.processor != nullptr, "MTP spec logits verify active processor is null");
+        RTP_LLM_CHECK_WITH_INFO(item.stream_idx < task.total_streams,
+                                "MTP spec logits verify stream_idx=%zu out of range, total_streams=%zu",
+                                item.stream_idx,
+                                task.total_streams);
+        if (layout.compact_slot_by_stream[item.stream_idx] >= 0) {
+            continue;
+        }
+        layout.compact_slot_by_stream[item.stream_idx] = static_cast<int32_t>(layout.stream_indices.size());
+        layout.stream_indices.push_back(item.stream_idx);
+    }
+    return layout;
+}
+
+void SpecLogitsVerifyRunner::ensureBuffersFit(const VerifyShape& shape) {
+    const int64_t B    = static_cast<int64_t>(shape.batch_size);
+    const int64_t P    = static_cast<int64_t>(shape.propose_step);
+    const int64_t rows = static_cast<int64_t>(shape.compact_rows);
+    const int64_t W    = static_cast<int64_t>(shape.bitmask_words);
+
+    auto cpu_i32    = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    auto pinned_i32 = cpu_i32.pinned_memory(true);
+    auto device_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
 
     if (!has2DCapacity(draft_tokens_cpu_, B, P)) {
         draft_tokens_cpu_ = torch::empty({B, P}, pinned_i32);
     }
     if (!has2DCapacity(processor_bitmask_cpu_, P + 1, W)) {
-        processor_bitmask_cpu_ = torch::empty({P + 1, W}, pinned_i32);
+        processor_bitmask_cpu_ = torch::empty({P + 1, W}, cpu_i32);
     }
     if (!has2DCapacity(merged_bitmask_cpu_, rows, W)) {
         merged_bitmask_cpu_ = torch::empty({rows, W}, pinned_i32);
-        std::fill_n(merged_bitmask_cpu_.data_ptr<int32_t>(),
-                    merged_bitmask_cpu_.numel(),
-                    SpecLogitsProcessor::kBitmaskAllowAll);
-        last_active_stream_rows_.clear();
+    }
+    if (!has2DCapacity(merged_bitmask_gpu_, rows, W)) {
+        merged_bitmask_gpu_ = torch::empty({rows, W}, device_i32);
+    }
+    if (!has1DCapacity(logits_row_indices_cpu_, rows)) {
+        logits_row_indices_cpu_ = torch::empty({rows}, pinned_i32);
+    }
+    if (!has1DCapacity(logits_row_indices_gpu_, rows)) {
+        logits_row_indices_gpu_ = torch::empty({rows}, device_i32);
     }
     if (!has1DCapacity(spec_cap_cpu_, B)) {
         spec_cap_cpu_ = torch::empty({B}, pinned_i32);
-    }
-    auto cuda_bool = torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA);
-    if (!has2DCapacity(disallow_mask_cpu_, rows, V)) {
-        disallow_mask_cpu_ = torch::zeros({rows, V}, pinned_bool);
-        last_active_stream_rows_.clear();
-    }
-    if (!has2DCapacity(disallow_mask_gpu_, rows, V)) {
-        disallow_mask_gpu_ = torch::zeros({rows, V}, cuda_bool);
-        last_active_stream_rows_.clear();
     }
 }
 
@@ -135,45 +122,32 @@ void SpecLogitsVerifyRunner::materializeDraftTokensToCpu(const LaunchTask& task)
     dst.copy_(draft_i32);
 }
 
-void SpecLogitsVerifyRunner::unpackRowToBoolDisallow(size_t row, size_t vocab_size, size_t bitmask_words) {
-    const auto* bits = merged_bitmask_cpu_.data_ptr<int32_t>() + row * bitmask_words;
-    auto*       out  = disallow_mask_cpu_.data_ptr<bool>() + row * disallow_mask_cpu_.size(1);
-    for (size_t token = 0; token < vocab_size; ++token) {
-        out[token] = !bitmaskAllowsToken(bits, bitmask_words, static_cast<int32_t>(token));
-    }
-}
+void SpecLogitsVerifyRunner::initializeCompactRows(const ActiveStreamLayout& layout, const VerifyShape& shape) {
+    auto compact_masks = merged_bitmask_cpu_.narrow(0, 0, static_cast<int64_t>(shape.compact_rows))
+                             .narrow(1, 0, static_cast<int64_t>(shape.bitmask_words));
+    fillAllAllowBitmask(compact_masks);
 
-std::vector<size_t> SpecLogitsVerifyRunner::resetPreviousActiveRows(const VerifyShape& shape) {
-    auto*               merged_base = merged_bitmask_cpu_.data_ptr<int32_t>();
-    std::vector<size_t> rows_to_reset;
-    rows_to_reset.reserve(last_active_stream_rows_.size());
-
-    for (size_t prev : last_active_stream_rows_) {
-        if (prev < shape.buffer_rows) {
-            std::fill_n(merged_base + prev * shape.row_words, shape.row_words, SpecLogitsProcessor::kBitmaskAllowAll);
-            rows_to_reset.push_back(prev);
+    auto* row_indices = logits_row_indices_cpu_.data_ptr<int32_t>();
+    for (size_t compact_stream = 0; compact_stream < layout.stream_indices.size(); ++compact_stream) {
+        const size_t stream_idx = layout.stream_indices[compact_stream];
+        for (int offset = 0; offset <= shape.propose_step; ++offset) {
+            const size_t compact_row =
+                compact_stream * static_cast<size_t>(shape.propose_step + 1) + static_cast<size_t>(offset);
+            row_indices[compact_row] =
+                static_cast<int32_t>(stream_idx * static_cast<size_t>(shape.propose_step + 1) + offset);
         }
     }
-    return rows_to_reset;
 }
 
-SpecLogitsVerifyRunner::MergeProcessorMasksResult
-SpecLogitsVerifyRunner::mergeProcessorMasks(const LaunchTask& task, const VerifyShape& shape) {
+SpecLogitsVerifyRunner::MergeProcessorMasksResult SpecLogitsVerifyRunner::mergeProcessorMasks(
+    const LaunchTask& task, const ActiveStreamLayout& layout, const VerifyShape& shape) {
     auto proc_mask = processor_bitmask_cpu_.narrow(0, 0, shape.propose_step + 1)
                          .narrow(1, 0, static_cast<int64_t>(shape.bitmask_words));
-    auto*               merged_base = merged_bitmask_cpu_.data_ptr<int32_t>();
-    auto*               cap_ptr     = spec_cap_cpu_.data_ptr<int32_t>();
-    std::vector<size_t> active_rows;
-    active_rows.reserve(task.active.size());
+    auto*                                 merged_base = merged_bitmask_cpu_.data_ptr<int32_t>();
+    auto*                                 cap_ptr     = spec_cap_cpu_.data_ptr<int32_t>();
     std::vector<std::optional<ErrorInfo>> processor_errors(shape.batch_size);
 
     for (const auto& item : task.active) {
-        RTP_LLM_CHECK_WITH_INFO(item.processor != nullptr, "MTP spec logits verify active processor is null");
-        RTP_LLM_CHECK_WITH_INFO(item.stream_idx < shape.batch_size,
-                                "MTP spec logits verify stream_idx=%zu out of range, total_streams=%zu",
-                                item.stream_idx,
-                                shape.batch_size);
-
         fillAllAllowBitmask(proc_mask);
         SpecLogitsProcessorRequest request;
         request.draft_tokens       = draft_tokens_cpu_.data_ptr<int32_t>() + item.stream_idx * shape.propose_step;
@@ -183,7 +157,7 @@ SpecLogitsVerifyRunner::mergeProcessorMasks(const LaunchTask& task, const Verify
         request.vocab_size         = shape.vocab_size;
 
         int  cap    = 0;
-        auto cap_or = item.processor->tryAcceptAndFillBitmask(request);
+        auto cap_or = item.processor->prepareSpeculative(request);
         if (!cap_or.ok()) {
             if (!processor_errors[item.stream_idx].has_value()) {
                 processor_errors[item.stream_idx] = cap_or.status();
@@ -192,45 +166,32 @@ SpecLogitsVerifyRunner::mergeProcessorMasks(const LaunchTask& task, const Verify
             cap = std::max(0, std::min(cap_or.value(), shape.propose_step));
         }
 
-        auto* merged_row = merged_base + item.stream_idx * shape.row_words;
-        bitwiseAndBitmaskInplace(merged_row, proc_mask.data_ptr<int32_t>(), shape.row_words);
+        const int32_t compact_slot = layout.compact_slot_by_stream[item.stream_idx];
+        RTP_LLM_CHECK_WITH_INFO(compact_slot >= 0, "MTP spec logits verify compact stream mapping is missing");
+        auto* merged_row = merged_base + static_cast<size_t>(compact_slot) * shape.words_per_stream;
+        bitwiseAndBitmaskInplace(merged_row, proc_mask.data_ptr<int32_t>(), shape.words_per_stream);
         cap_ptr[item.stream_idx] = std::min<int32_t>(cap_ptr[item.stream_idx], cap);
-        appendUniqueRow(active_rows, item.stream_idx);
     }
-    return {std::move(active_rows), std::move(processor_errors)};
-}
-
-void SpecLogitsVerifyRunner::uploadChangedRows(const std::vector<size_t>& rows_to_reset,
-                                               const std::vector<size_t>& active_rows,
-                                               const VerifyShape&         shape) {
-    auto upload_stream_row = [&](size_t stream_row) {
-        const size_t row_begin = stream_row * static_cast<size_t>(shape.propose_step + 1);
-        for (size_t row = row_begin; row < row_begin + static_cast<size_t>(shape.propose_step + 1); ++row) {
-            unpackRowToBoolDisallow(row, shape.vocab_size, shape.bitmask_words);
-        }
-        auto cpu_slice = disallow_mask_cpu_.narrow(0, row_begin, shape.propose_step + 1)
-                             .narrow(1, 0, static_cast<int64_t>(shape.vocab_size));
-        auto gpu_slice = disallow_mask_gpu_.narrow(0, row_begin, shape.propose_step + 1)
-                             .narrow(1, 0, static_cast<int64_t>(shape.vocab_size));
-        gpu_slice.copy_(cpu_slice, /*non_blocking=*/true);
-    };
-
-    for (size_t row : rows_to_reset) {
-        upload_stream_row(row);
-    }
-    for (size_t row : active_rows) {
-        upload_stream_row(row);
-    }
+    return {std::move(processor_errors)};
 }
 
 SpecLogitsVerifyRunner::LaunchResult SpecLogitsVerifyRunner::makeResult(const VerifyShape& shape) {
+    auto packed_mask_cpu = merged_bitmask_cpu_.narrow(0, 0, static_cast<int64_t>(shape.compact_rows))
+                               .narrow(1, 0, static_cast<int64_t>(shape.bitmask_words));
+    auto packed_mask_gpu = merged_bitmask_gpu_.narrow(0, 0, static_cast<int64_t>(shape.compact_rows))
+                               .narrow(1, 0, static_cast<int64_t>(shape.bitmask_words));
+    auto row_indices_cpu = logits_row_indices_cpu_.narrow(0, 0, static_cast<int64_t>(shape.compact_rows));
+    auto row_indices_gpu = logits_row_indices_gpu_.narrow(0, 0, static_cast<int64_t>(shape.compact_rows));
+    packed_mask_gpu.copy_(packed_mask_cpu, /*non_blocking=*/true);
+    row_indices_gpu.copy_(row_indices_cpu, /*non_blocking=*/true);
+
     LaunchResult result;
-    result.spec_vocab_mask_gpu = disallow_mask_gpu_.narrow(0, 0, static_cast<int64_t>(shape.rows))
-                                     .narrow(1, 0, static_cast<int64_t>(shape.vocab_size));
-    result.has_active_processor = true;
-    result.spec_vocab_mask_cpu_lifetime = disallow_mask_cpu_.narrow(0, 0, static_cast<int64_t>(shape.rows))
-                                              .narrow(1, 0, static_cast<int64_t>(shape.vocab_size));
-    result.spec_cap_cpu = spec_cap_cpu_.narrow(0, 0, static_cast<int64_t>(shape.batch_size));
+    result.packed_allow_mask_gpu           = std::move(packed_mask_gpu);
+    result.logits_row_indices_gpu          = std::move(row_indices_gpu);
+    result.has_active_processor            = true;
+    result.packed_allow_mask_cpu_lifetime  = std::move(packed_mask_cpu);
+    result.logits_row_indices_cpu_lifetime = std::move(row_indices_cpu);
+    result.spec_cap_cpu                    = spec_cap_cpu_.narrow(0, 0, static_cast<int64_t>(shape.batch_size));
     return result;
 }
 
@@ -245,23 +206,31 @@ SpecLogitsVerifyRunner::LaunchResult SpecLogitsVerifyRunner::run(const LaunchTas
     const int    P = task.propose_step;
     const size_t V = task.vocab_size;
     RTP_LLM_CHECK_WITH_INFO(B > 0 && P > 0 && V > 0, "invalid MTP spec logits verify task");
-    const size_t W    = SpecLogitsProcessor::bitmaskWordCount(V);
-    const size_t rows = B * static_cast<size_t>(P + 1);
+    RTP_LLM_CHECK_WITH_INFO(P < std::numeric_limits<int32_t>::max(),
+                            "MTP spec logits verify propose_step exceeds int32 row-stride capacity");
+    RTP_LLM_CHECK_WITH_INFO(V <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                            "MTP spec logits verify vocab_size exceeds kernel int32 capacity");
+    const size_t rows_per_stream = static_cast<size_t>(P) + 1;
+    RTP_LLM_CHECK_WITH_INFO(B <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) / rows_per_stream,
+                            "MTP spec logits verify row count exceeds int32 row-index capacity");
+    auto         layout = buildActiveStreamLayout(task);
+    const size_t W      = SpecLogitsProcessorRequest::bitmaskWordCount(V);
+    VerifyShape  shape{
+        B,
+        P,
+        V,
+        W,
+        layout.stream_indices.size() * rows_per_stream,
+        rows_per_stream * W,
+    };
 
-    VerifyShape shape{B, P, V, W, rows, static_cast<size_t>(P + 1) * W, 0};
-
-    ensureBuffersFit(B, P, V, W);
-    shape.buffer_rows = static_cast<size_t>(merged_bitmask_cpu_.size(0)) / static_cast<size_t>(P + 1);
-
-    auto rows_to_reset = resetPreviousActiveRows(shape);
+    ensureBuffersFit(shape);
     std::fill_n(spec_cap_cpu_.data_ptr<int32_t>(), B, P);
-
     materializeDraftTokensToCpu(task);
-    auto merge_result = mergeProcessorMasks(task, shape);
-    uploadChangedRows(rows_to_reset, merge_result.active_rows, shape);
-    last_active_stream_rows_ = std::move(merge_result.active_rows);
-    auto result              = makeResult(shape);
-    result.processor_errors  = std::move(merge_result.processor_errors);
+    initializeCompactRows(layout, shape);
+    auto merge_result       = mergeProcessorMasks(task, layout, shape);
+    auto result             = makeResult(shape);
+    result.processor_errors = std::move(merge_result.processor_errors);
     return result;
 }
 

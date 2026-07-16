@@ -18,6 +18,7 @@
 #include "autil/TimeUtility.h"
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <random>
 
@@ -30,6 +31,18 @@ torch::Tensor toCpuInt32(torch::Tensor tensor) {
         tensor = tensor.cpu();
     }
     return tensor.scalar_type() == torch::kInt32 ? tensor.contiguous() : tensor.to(torch::kInt32).contiguous();
+}
+
+std::optional<ErrorInfo> validateMtpCompatibility(const std::vector<BaseLogitsProcessorPtr>& processors) {
+    for (size_t i = 0; i < processors.size(); ++i) {
+        const auto capability = processors[i]->mtpCapability();
+        if (capability.mode == MtpProcessorMode::UNSUPPORTED) {
+            return ErrorInfo(ErrorCode::INVALID_PARAMS,
+                             "MTP decode is incompatible with logits processor: processor_index=" + std::to_string(i)
+                                 + ", mode=unsupported, reason=" + std::string(capability.reason));
+        }
+    }
+    return std::nullopt;
 }
 
 void applySpecVerifyResult(SpecLogitsVerifyRunner::LaunchResult&  verify_result,
@@ -61,8 +74,8 @@ void applySpecVerifyResult(SpecLogitsVerifyRunner::LaunchResult&  verify_result,
     const int64_t token_stride = target_token_ids.size(1);
     const auto*   cap_ptr      = cap_cpu.data_ptr<int32_t>();
     const auto*   target_ptr   = target_token_ids.data_ptr<int32_t>();
-    const int      max_cap     = static_cast<int>(propose_step);
-    const int      max_len     = max_cap + 1;
+    const int     max_cap      = static_cast<int>(propose_step);
+    const int     max_len      = max_cap + 1;
     for (int64_t i = 0; i < batch_size; ++i) {
         const int token_cap = std::max(0, std::min<int>(cap_ptr[i], max_cap));
         const int old_len   = output.accept_len[i];
@@ -82,10 +95,6 @@ void applySpecVerifyResult(SpecLogitsVerifyRunner::LaunchResult&  verify_result,
             output.accept_tokens[i] = output.accept_tokens[i].narrow(1, 0, new_len).contiguous();
         }
     }
-}
-
-bool hasMtpIncompatibleProcessor(const GenerateStreamPtr& stream) {
-    return stream && !stream->logitsProcessors().mtpCompatible();
 }
 
 }  // namespace
@@ -285,8 +294,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
 
     if (!params.py_model.is_none()) {
         RTP_LLM_LOG_INFO("init executor with python model");
-        model_.reset(new PyWrappedModel(
-            model_init_params, params.py_model, false, true));
+        model_.reset(new PyWrappedModel(model_init_params, params.py_model, false, true));
     }
 
     // when warmup, cache manager maybe nullptr
@@ -327,8 +335,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                 cache_manager});
         if (!params.py_sp_model.is_none()) {
             RTP_LLM_LOG_INFO("[speculative decoding] using py model");
-            draft_model_.reset(new PyWrappedModel(
-                model_params, params.py_sp_model, false, false));
+            draft_model_.reset(new PyWrappedModel(model_params, params.py_sp_model, false, false));
             // Create separate model for speculative prefill with CUDA graph if enabled (from params)
             const bool enable_cuda_graph = params.hw_kernel_config.enable_cuda_graph;
             RTP_LLM_LOG_INFO(
@@ -337,8 +344,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
             if (enable_cuda_graph) {
                 RTP_LLM_LOG_INFO(
                     "[speculative decoding] creating separate prefill draft model with CUDA graph support");
-                sp_prefill_draft_model_.reset(new PyWrappedModel(
-                    model_params, params.py_sp_model, true, false));
+                sp_prefill_draft_model_.reset(new PyWrappedModel(model_params, params.py_sp_model, true, false));
             }
         }
         break;  // NOTE: only support one mtp model now
@@ -845,11 +851,8 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
         const bool is_context_stream = stream->isContextStream();
         // Capability compatibility is a stream admission property, so reject it
         // before either prefill or decode can publish an output token.
-        if (hasMtpIncompatibleProcessor(stream)) {
-            stream->reportError(ErrorCode::INVALID_PARAMS,
-                                "MTP decode requires score-batch/spec-verify capable logits processors; "
-                                "found normal-decode-only logits processor; disable MTP or disable the "
-                                "incompatible logits processor");
+        if (auto error = validateMtpCompatibility(stream->getAllLogitsProcessorPtr()); error.has_value()) {
+            stream->reportError(error->code(), error->ToString());
             continue;
         }
 
@@ -1037,8 +1040,8 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     }
 }
 
-SpecLogitsVerifyRunner::LaunchResult
-MtpExecutor::runSpecLogitsVerify(const std::list<GenerateStreamPtr>& streams, const torch::Tensor& draft_tokens) {
+SpecLogitsVerifyRunner::LaunchResult MtpExecutor::runSpecLogitsVerify(const std::list<GenerateStreamPtr>& streams,
+                                                                      const torch::Tensor& draft_tokens) {
     SpecLogitsVerifyRunner::LaunchTask task;
     task.total_streams = streams.size();
     task.propose_step  = static_cast<int>(propose_step_);
@@ -1047,8 +1050,10 @@ MtpExecutor::runSpecLogitsVerify(const std::list<GenerateStreamPtr>& streams, co
 
     size_t stream_idx = 0;
     for (const auto& stream : streams) {
-        for (const auto& processor : stream->logitsProcessors().specProcessors()) {
-            task.active.push_back({processor, stream_idx});
+        for (const auto& processor : stream->getAllLogitsProcessorPtr()) {
+            if (processor->mtpCapability().mode == MtpProcessorMode::SPEC_VERIFY) {
+                task.active.push_back({processor, stream_idx});
+            }
         }
         ++stream_idx;
     }
@@ -1057,9 +1062,9 @@ MtpExecutor::runSpecLogitsVerify(const std::list<GenerateStreamPtr>& streams, co
 
 SpecLogitsVerifyRunner::LaunchResult
 MtpExecutor::runSpecLogitsVerifyIfNeeded(const std::list<GenerateStreamPtr>& streams,
-                                         const GptModelInputs&              model_input,
-                                         const SamplerOutput&               draft_sampler_output,
-                                         const torch::Tensor&               draft_token_ids) {
+                                         const GptModelInputs&               model_input,
+                                         const SamplerOutput&                draft_sampler_output,
+                                         const torch::Tensor&                draft_token_ids) {
     if (!isTpRank0() || warm_up_ || model_input.is_fake_stream) {
         return {};
     }

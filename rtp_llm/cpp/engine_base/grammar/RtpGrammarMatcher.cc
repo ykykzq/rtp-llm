@@ -46,13 +46,16 @@ RtpGrammarMatcher::RtpGrammarMatcher(std::shared_ptr<xgrammar::CompiledGrammar> 
                                      std::optional<std::vector<int32_t>>        override_stop_tokens,
                                      bool                                       terminate_without_stop_token,
                                      int                                        max_rollback_tokens):
-    compiled_(std::move(compiled)) {
+    compiled_(std::move(compiled)),
+    override_stop_tokens_(std::move(override_stop_tokens)),
+    terminate_without_stop_token_(terminate_without_stop_token),
+    max_rollback_tokens_(max_rollback_tokens) {
     if (!compiled_) {
         throw std::invalid_argument("RtpGrammarMatcher requires a non-null CompiledGrammar");
     }
 
     matcher_ = std::make_unique<xgrammar::GrammarMatcher>(
-        *compiled_, std::move(override_stop_tokens), terminate_without_stop_token, max_rollback_tokens);
+        *compiled_, override_stop_tokens_, terminate_without_stop_token_, max_rollback_tokens_);
 }
 
 ErrorResult<bool> RtpGrammarMatcher::acceptToken(int32_t token_id) {

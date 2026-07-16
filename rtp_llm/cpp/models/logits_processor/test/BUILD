@@ -71,6 +71,7 @@ cc_test(
     deps = [
         "//rtp_llm/cpp/engine_base/grammar:grammar_cpp_lib",
         "//rtp_llm/cpp/models:logits_processor",
+        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@local_config_cuda//cuda:cuda_headers",
