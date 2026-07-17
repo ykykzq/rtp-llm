@@ -20,6 +20,7 @@ cc_library(
         "//rtp_llm/models_py/bindings/core:types_hdr",
         "//rtp_llm/models_py/bindings/core:type_convert",
         "//rtp_llm/models_py/bindings/core:common_defines",
+        "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_util",
     ] + torch_deps(),
     copts = copts(),
 )
@@ -31,8 +32,6 @@ cc_library(
     srcs = ["CopyOps.cc"],
     deps = [
         ":copy_ops_hdrs",
-        "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_util",
-        "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_kernel",
     ] + select({
         "@//:using_cuda": [
             "@local_config_cuda//cuda:cuda_headers",
@@ -40,6 +39,7 @@ cc_library(
             "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
             "//rtp_llm/models_py/bindings/common/kernels:kernels_copy",
             "//rtp_llm/models_py/bindings/common/kernels:kernels_sampling",
+            "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_kernel",
         ],
         "@//:using_rocm": [
             "@local_config_rocm//rocm:rocm_headers",
@@ -47,6 +47,7 @@ cc_library(
             "//rtp_llm/models_py/bindings/common/kernels:kernels_copy",
             "//rtp_llm/models_py/bindings/rocm:rocm_host_utils",
             "//rtp_llm/models_py/bindings/rocm:rocm_types_hdr",
+            "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_kernel",
         ],
         "//conditions:default": [],
     }) + torch_deps(),
