@@ -21,6 +21,7 @@ from rtp_llm.ops import (
     DeviceResourceConfig,
     FfnDisAggregateConfig,
     FMHAConfig,
+    GrammarConfig,
     GrpcConfig,
     HWKernelConfig,
     MiscellaneousConfig,
@@ -68,6 +69,7 @@ class EngineConfig:
     misc_config: MiscellaneousConfig
     arpc_config: ArpcConfig
     grpc_config: GrpcConfig
+    grammar_config: GrammarConfig
     load_config: LoadConfig
 
     def to_string(self) -> str:
@@ -173,6 +175,17 @@ class EngineConfig:
         else:
             lines.append(str(self.arpc_config))
 
+        lines.append("\n[GrpcConfig]")
+        if hasattr(self.grpc_config, "to_string"):
+            lines.append(self.grpc_config.to_string())
+        else:
+            lines.append(str(self.grpc_config))
+
+        lines.append("\n[GrammarConfig]")
+        if hasattr(self.grammar_config, "to_string"):
+            lines.append(self.grammar_config.to_string())
+        else:
+            lines.append(str(self.grammar_config))
         lines.append("\n[LoadConfig]")
         if hasattr(self.load_config, "to_string"):
             lines.append(self.load_config.to_string())
@@ -226,6 +239,7 @@ class EngineConfig:
         cache_store_config = py_env_configs.cache_store_config
         arpc_config = py_env_configs.arpc_config
         grpc_config = py_env_configs.grpc_config
+        grammar_config = py_env_configs.grammar_config
         load_config = py_env_configs.load_config
 
         # role_config.role_type property automatically converts string to RoleType enum
@@ -263,6 +277,7 @@ class EngineConfig:
             misc_config=misc_config,
             arpc_config=arpc_config,
             grpc_config=grpc_config,
+            grammar_config=grammar_config,
             load_config=load_config,
         )
 

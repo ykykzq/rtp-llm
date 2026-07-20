@@ -16,6 +16,7 @@ from rtp_llm.ops import (
     EPLBConfig,
     FfnDisAggregateConfig,
     FMHAConfig,
+    GrammarConfig,
     GrpcConfig,
     HWKernelConfig,
     MiscellaneousConfig,
@@ -353,6 +354,24 @@ class GenerateEnvConfig:
         )
 
 
+class RepetitionDetectionConfig:
+    def __init__(self):
+        self.tool_call_loop_monitor: bool = True
+        self.tool_call_loop_threshold: int = 5
+        self.tool_call_loop_max_span_tokens: int = 16384
+        self.tool_call_loop_begin_marker: str = ""
+        self.tool_call_loop_end_marker: str = ""
+
+    def to_string(self):
+        return (
+            f"tool_call_loop_monitor: {self.tool_call_loop_monitor}\n"
+            f"tool_call_loop_threshold: {self.tool_call_loop_threshold}\n"
+            f"tool_call_loop_max_span_tokens: {self.tool_call_loop_max_span_tokens}\n"
+            f"tool_call_loop_begin_marker: {self.tool_call_loop_begin_marker}\n"
+            f"tool_call_loop_end_marker: {self.tool_call_loop_end_marker}"
+        )
+
+
 class QuantizationConfig:
     def __init__(self):
         self.int8_mode: int = 0
@@ -490,6 +509,9 @@ class PyEnvConfigs:
         self.distribute_config: DistributeConfig = DistributeConfig()
         self.vit_config: VitConfig = VitConfig()
         self.generate_env_config: GenerateEnvConfig = GenerateEnvConfig()
+        self.repetition_detection_config: RepetitionDetectionConfig = (
+            RepetitionDetectionConfig()
+        )
         self.quantization_config: QuantizationConfig = QuantizationConfig()
         self.eplb_config: EPLBConfig = EPLBConfig()
         self.kv_cache_config: KVCacheConfig = KVCacheConfig()
@@ -515,6 +537,7 @@ class PyEnvConfigs:
         self.cache_store_config = CacheStoreConfig()
         self.arpc_config = ArpcConfig()
         self.grpc_config = GrpcConfig()
+        self.grammar_config = GrammarConfig()
         self.deep_ep_config = DeepEPConfig()
         self.prefill_cp_config = PrefillCPConfig()
 
@@ -532,6 +555,9 @@ class PyEnvConfigs:
             "[distribute_config]\n" + self.distribute_config.to_string() + "\n\n"
             "[vit_config]\n" + self.vit_config.to_string() + "\n\n"
             "[generate_env_config]\n" + self.generate_env_config.to_string() + "\n\n"
+            "[repetition_detection_config]\n"
+            + self.repetition_detection_config.to_string()
+            + "\n\n"
             "[quantization_config]\n" + self.quantization_config.to_string() + "\n\n"
             "[eplb_config]\n" + self.eplb_config.to_string() + "\n\n"
             "[kv_cache_config]\n" + self.kv_cache_config.to_string() + "\n\n"
@@ -566,5 +592,6 @@ class PyEnvConfigs:
             + self.runtime_config.fifo_scheduler_config.to_string()
             + "\n\n"
             "[grpc_config]\n" + self.grpc_config.to_string() + "\n\n"
+            "[grammar_config]\n" + self.grammar_config.to_string() + "\n\n"
             "[prefill_cp_config]\n" + self.prefill_cp_config.to_string() + "\n\n"
         )

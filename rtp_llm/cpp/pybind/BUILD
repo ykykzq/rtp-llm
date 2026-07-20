@@ -85,12 +85,14 @@ cc_library(
         "common/InitEngineOps.cc",
         "multi_gpu_gpt/RtpEmbeddingOp.cc",
         "multi_gpu_gpt/RtpLLMOp.cc",
+        "multi_gpu_gpt/XGrammarBootstrap.cc",
     ],
     hdrs = [
         "common/InitEngineOps.h",
         "common/blockUtil.h",
         "multi_gpu_gpt/RtpEmbeddingOp.h",
         "multi_gpu_gpt/RtpLLMOp.h",
+        "multi_gpu_gpt/XGrammarBootstrap.h",
     ],
     deps = [
         "//rtp_llm/cpp/api_server:http_api_server",
@@ -99,6 +101,7 @@ cc_library(
         "//rtp_llm/cpp/cache:cache",
         "//rtp_llm/cpp/utils:signal_utils",
         "//:rtp_compute_ops",
+        "@xgrammar//:xgrammar",
     ] + torch_deps() + select({
         "//:using_cuda": [
             "//rtp_llm/models_py/bindings/cuda/ops:gpu_base",
