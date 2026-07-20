@@ -23,6 +23,7 @@ private:
                               const torch::Tensor& new_tokens_all,
                               const torch::Tensor& token_ids_cpu,
                               const torch::Tensor& success_cpu,
+                              bool                 return_content_logprobs,
                               int                  logprobs_batch_idx,
                               const torch::Tensor& token_logprobs_cpu,
                               const torch::Tensor& top_logprob_token_ids_cpu,

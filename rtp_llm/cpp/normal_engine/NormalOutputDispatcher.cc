@@ -78,9 +78,16 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
     const size_t total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
     RTP_LLM_CHECK(total_batch_size_out == (size_t)sampler_output.token_ids.size(0));
 
-    auto       all_streams          = stream_groups.allStreams();
-    const bool need_return_logprobs = stream_groups.needReturnLogProbs();
-    bool       any_beam_search      = false;
+    auto all_streams              = stream_groups.allStreams();
+    bool need_return_logprobs     = false;
+    int  max_content_top_logprobs = 0;
+    for (const auto& stream : all_streams) {
+        if (stream->shouldComputeLogprobs()) {
+            need_return_logprobs     = true;
+            max_content_top_logprobs = std::max(max_content_top_logprobs, stream->generateConfig()->top_logprobs);
+        }
+    }
+    bool any_beam_search = false;
     if (sampler_output.token_ids.defined() && sampler_output.token_ids.size(1) > 1) {
         for (const auto& stream : all_streams) {
             if (stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1) {
@@ -112,7 +119,7 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         for (const auto& stream : all_streams) {
             const int64_t cur_batch_size  = stream->currentBatchSize();
             const int64_t next_batch_size = stream->nextBatchSize();
-            if (stream->generateConfig()->return_logprobs) {
+            if (stream->shouldComputeLogprobs()) {
                 for (int64_t i = 0; i < cur_batch_size; ++i) {
                     expected_raw_row_indices.push_back(model_batch_idx + i);
                 }
@@ -249,7 +256,7 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         compact_token_logprobs = selected_logits - output_log_normalizers;
 
         const int64_t max_top_logprobs =
-            std::min<int64_t>(std::max<int64_t>(stream_groups.maxTopLogProbs(), 0), real_vocab_size);
+            std::min<int64_t>(std::max<int64_t>(max_content_top_logprobs, 0), real_vocab_size);
         if (max_top_logprobs > 0) {
             auto topk_result        = raw_logits.topk(max_top_logprobs, -1, true, true);
             auto input_top_logprobs = std::get<0>(topk_result).to(torch::kFloat32) - log_normalizers;
@@ -285,9 +292,10 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
     auto new_tokens_all     = torch::empty({(int64_t)total_batch_size_out, 1}, torch::kInt32);
 
     for (const auto& stream : all_streams) {
-        auto cur_batch_size  = stream->currentBatchSize();
-        auto next_batch_size = stream->nextBatchSize();
-        auto token_size      = stream->currentExecuteTokenSize();
+        auto       cur_batch_size          = stream->currentBatchSize();
+        auto       next_batch_size         = stream->nextBatchSize();
+        auto       token_size              = stream->currentExecuteTokenSize();
+        const bool return_content_logprobs = stream->shouldComputeLogprobs();
 
         dispatchSingleStream(stream,
                              merge_outputs,
@@ -298,6 +306,7 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
                              new_tokens_all,
                              token_ids_cpu,
                              success_cpu,
+                             return_content_logprobs,
                              logprobs_batch_idx,
                              compact_token_logprobs,
                              compact_top_logprob_token_ids,
@@ -306,7 +315,7 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         batch_idx_in += cur_batch_size;
         batch_idx_out += next_batch_size;
         token_offset += token_size;
-        if (stream->generateConfig()->return_logprobs) {
+        if (return_content_logprobs) {
             logprobs_batch_idx += next_batch_size;
         }
     }
@@ -324,6 +333,7 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
                                                   const torch::Tensor& new_tokens_all,
                                                   const torch::Tensor& token_ids_cpu,
                                                   const torch::Tensor& success_cpu,
+                                                  bool                 return_content_logprobs,
                                                   int                  logprobs_batch_idx,
                                                   const torch::Tensor& token_logprobs_cpu,
                                                   const torch::Tensor& top_logprob_token_ids_cpu,
@@ -403,7 +413,7 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
     torch::Tensor token_logprobs;
     torch::Tensor top_logprob_token_ids;
     torch::Tensor top_logprobs;
-    if (stream->generateConfig()->return_logprobs) {
+    if (return_content_logprobs) {
         RTP_LLM_CHECK(token_logprobs_cpu.defined());
         RTP_LLM_CHECK(top_logprob_token_ids_cpu.defined());
         RTP_LLM_CHECK(top_logprobs_cpu.defined());
@@ -457,6 +467,8 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
 
     RTP_LLM_LOG_DEBUG("stream [%ld], new_tokens size = [%ld]", stream->streamId(), new_tokens.numel());
 
+    const int32_t logprobs_offset =
+        stream->generateConfig()->return_logprobs ? stream->logprobsContentOffset(new_tokens, 1) : 0;
     stream->update({has_beam_search ? batch_new_all_token_ids : new_tokens,
                     1,
                     batch_hidden_states,
@@ -471,7 +483,9 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
                     false,
                     token_logprobs,
                     top_logprob_token_ids,
-                    top_logprobs});
+                    top_logprobs,
+                    -1,
+                    logprobs_offset});
 }
 
 }  // namespace rtp_llm

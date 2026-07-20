@@ -59,6 +59,11 @@ struct MtpTargetLogprobs {
     }
 };
 
+// Prefill knows the output phase before it reduces target logits. Only
+// requests that have already entered content may determine the shared top-k
+// width; a reasoning-only request must not allocate a wider compact payload.
+int64_t maxMtpActiveContentTopLogprobs(const StreamGroups& stream_groups);
+
 // Decode uses an identity capture for both all-request and mixed batches.
 // Stream-async decode finalizes that payload in the current step so draft work
 // and the next process do not retain the complete target LM-head storage.

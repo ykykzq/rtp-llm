@@ -54,7 +54,7 @@ absl::StatusOr<SamplerInputs> NormalSamplerInputGatherer::gather(const StreamGro
         }
         return_logits |= stream->returnLogits();
         calculate_softmax_probs |= stream->calculateSoftmaxProbs();
-        if (stream->generateConfig()->return_logprobs) {
+        if (stream->shouldComputeLogprobs()) {
             for (int i = 0; i < current_batch_size; ++i) {
                 raw_logprobs_row_indices.push_back(static_cast<int64_t>(model_batch_idx + i));
             }

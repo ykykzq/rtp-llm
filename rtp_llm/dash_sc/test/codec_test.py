@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 from unittest import TestCase, main
 
@@ -1427,6 +1428,100 @@ class BuildStreamResponseFromGenerateOutputsTest(TestCase):
         self.assertEqual(wire_rows[0]["128822"], 0.0)
         self.assertEqual(wire_rows[1]["271"], 0.0)
         self.assertTrue(all(len(row) == 5 for row in wire_rows))
+
+    def test_compact_thinking_only_frame_materializes_placeholders(self) -> None:
+        out = GenerateOutput(
+            output_ids=torch.tensor([10, 11, 128822], dtype=torch.int32),
+            logprobs_offset=3,
+            logprobs_count=0,
+            finished=False,
+        )
+        infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id="compact-thinking-only",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[out]),
+            request_log_tag="tag",
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=2),
+        ).infer_response
+
+        metadata = {item.name: item for item in infer.outputs}
+        raw = {
+            item.name: infer.raw_output_contents[index]
+            for index, item in enumerate(infer.outputs)
+        }
+        self.assertEqual(list(metadata["token_logprobs"].shape), [1, 3])
+        self.assertEqual(_unpack_fp32_le(raw["token_logprobs"]), [0.0, 0.0, 0.0])
+        self.assertEqual(
+            _unpack_int32_le(raw["top_logprob_token_ids"]),
+            [10, 0, 11, 0, 128822, 0],
+        )
+        top_values = _unpack_fp32_le(raw["top_logprobs"])
+        self.assertEqual(top_values[::2], [0.0, 0.0, 0.0])
+        self.assertTrue(all(math.isinf(value) for value in top_values[1::2]))
+
+        wire_rows = json.loads(infer.parameters["logprobs"].string_param)
+        self.assertEqual(
+            wire_rows,
+            [
+                {"10": 0.0, "0": -math.inf},
+                {"11": 0.0, "0": -math.inf},
+                {"128822": 0.0, "0": -math.inf},
+            ],
+        )
+
+    def test_reasoning_prefix_uses_placeholders_and_content_keeps_logprobs(
+        self,
+    ) -> None:
+        out = GenerateOutput(
+            output_ids=torch.tensor([10, 128822, 271, 20], dtype=torch.int32),
+            token_logprobs=torch.tensor([-0.13, -0.20], dtype=torch.float32),
+            top_logprob_token_ids=torch.tensor(
+                [[271, 2], [20, 120]],
+                dtype=torch.int32,
+            ),
+            top_logprobs=torch.tensor(
+                [[-0.13, -1.13], [-0.20, -1.20]],
+                dtype=torch.float32,
+            ),
+            logprobs_offset=2,
+            logprobs_count=2,
+            finished=False,
+        )
+        infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id="reasoning-content-boundary",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[out]),
+            request_log_tag="tag",
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=2),
+        ).infer_response
+
+        metadata = {item.name: item for item in infer.outputs}
+        raw = {
+            item.name: infer.raw_output_contents[index]
+            for index, item in enumerate(infer.outputs)
+        }
+        token_values = _unpack_fp32_le(raw["token_logprobs"])
+        self.assertEqual(token_values[:2], [0.0, 0.0])
+        self.assertAlmostEqual(token_values[2], -0.13)
+        self.assertAlmostEqual(token_values[3], -0.20)
+        self.assertEqual(list(metadata["token_logprobs"].shape), [1, 4])
+        self.assertEqual(
+            _unpack_int32_le(raw["top_logprob_token_ids"]),
+            [10, 0, 128822, 0, 271, 2, 20, 120],
+        )
+        top_values = _unpack_fp32_le(raw["top_logprobs"])
+        self.assertEqual(top_values[0], 0.0)
+        self.assertTrue(math.isinf(top_values[1]))
+        self.assertEqual(top_values[2], 0.0)
+        self.assertTrue(math.isinf(top_values[3]))
+        self.assertAlmostEqual(top_values[4], -0.13)
+        self.assertAlmostEqual(top_values[6], -0.20)
+
+        wire_rows = json.loads(infer.parameters["logprobs"].string_param)
+        self.assertEqual(wire_rows[0]["10"], 0.0)
+        self.assertEqual(wire_rows[1]["128822"], 0.0)
+        self.assertAlmostEqual(wire_rows[2]["271"], -0.13)
+        self.assertAlmostEqual(wire_rows[3]["20"], -0.20)
 
     def test_disabled_request_ignores_stale_logprob_tensors(self) -> None:
         out = GenerateOutput(

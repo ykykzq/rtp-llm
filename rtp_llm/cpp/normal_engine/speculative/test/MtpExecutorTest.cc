@@ -571,6 +571,25 @@ TEST_F(MtpExecutorTest, testFinalizeSelectedMtpTargetLogprobsReducesOnlyAccepted
     EXPECT_TRUE(torch::allclose(result.top_logprobs, std::get<0>(expected_topk)));
 }
 
+TEST_F(MtpExecutorTest, testFinalizeSelectedMtpTargetLogprobsAllowsEmptyContentSelection) {
+    auto logits      = torch::tensor({{3.0f, -1.0f, 0.5f, 2.0f}, {0.0f, 4.0f, 1.0f, 3.0f}}, torch::kFloat32);
+    auto emitted_ids = torch::tensor({1, 2}, torch::kInt32).reshape({1, 2});
+    auto result      = captureMtpDecodeTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/4);
+
+    ASSERT_TRUE(result.retainsFullLmHeadStorage());
+    ASSERT_FALSE(result.finalized());
+    finalizeSelectedMtpTargetLogprobs(result, emitted_ids, /*selected_dense_row_indices=*/{});
+
+    ASSERT_TRUE(result.finalized());
+    EXPECT_FALSE(result.retainsFullLmHeadStorage());
+    EXPECT_FALSE(result.raw_logits.defined());
+    EXPECT_FALSE(result.row_logsumexp.defined());
+    EXPECT_FALSE(result.top_logits.defined());
+    EXPECT_EQ(result.token_logprobs.sizes(), (torch::IntArrayRef{0}));
+    EXPECT_EQ(result.top_logprob_token_ids.sizes(), (torch::IntArrayRef{0, 2}));
+    EXPECT_EQ(result.top_logprobs.sizes(), (torch::IntArrayRef{0, 2}));
+}
+
 TEST_F(MtpExecutorTest, testDenseMixedMtpDecodeLogprobCaptureRemainsZeroCopy) {
     // Model a P=5 batch where 127/128 streams request logprobs and each emits
     // one row. Decode capture must not materialize the almost-full [762,V]

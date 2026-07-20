@@ -53,17 +53,21 @@ protected:
                        int                                  top_logprobs,
                        int                                  max_new_tokens,
                        bool                                 is_streaming,
-                       const std::vector<std::vector<int>>& stop_words_list = {}) {
-        auto query             = std::make_shared<GenerateInput>();
-        query->input_ids       = hostIntBuffer({0});
-        query->generate_config = std::make_shared<GenerateConfig>();
-        auto& config           = *query->generate_config;
-        config.return_logprobs = return_logprobs;
-        config.top_logprobs    = top_logprobs;
-        config.max_new_tokens  = max_new_tokens;
-        config.is_streaming    = is_streaming;
-        config.ignore_eos      = true;
-        config.stop_words_list = stop_words_list;
+                       const std::vector<std::vector<int>>& stop_words_list     = {},
+                       bool                                 in_think_mode       = false,
+                       const std::vector<int>&              end_think_token_ids = {}) {
+        auto query                 = std::make_shared<GenerateInput>();
+        query->input_ids           = hostIntBuffer({0});
+        query->generate_config     = std::make_shared<GenerateConfig>();
+        auto& config               = *query->generate_config;
+        config.return_logprobs     = return_logprobs;
+        config.top_logprobs        = top_logprobs;
+        config.max_new_tokens      = max_new_tokens;
+        config.is_streaming        = is_streaming;
+        config.ignore_eos          = true;
+        config.stop_words_list     = stop_words_list;
+        config.in_think_mode       = in_think_mode;
+        config.end_think_token_ids = end_think_token_ids;
         ResourceContext resource_context;
         RuntimeConfig   runtime_config;
         auto            stream =
@@ -380,8 +384,7 @@ TEST_F(NormalBatchStreamProcessorTest, testCompactRawLogprobsAccumulateForNonStr
     auto model_config = makeLogprobsModelConfig();
     auto processor    = makeLogprobsProcessor(model_config);
     auto stream       = makeLogprobsStream(model_config, true, 2, 2, false);
-    ASSERT_EQ(stream->getTokenLogProbs().size(1), 2);
-    ASSERT_LT(stream->getTokenLogProbs().size(1), model_config.max_seq_len);
+    ASSERT_FALSE(stream->getTokenLogProbs().defined());
 
     auto step1_logits = torch::tensor({0.0f, 1.0f, 2.0f, 3.0f}, torch::kFloat32).reshape({1, 4});
     auto step2_logits = torch::tensor({4.0f, 1.0f, 0.0f, -1.0f}, torch::kFloat32).reshape({1, 4});
@@ -396,6 +399,8 @@ TEST_F(NormalBatchStreamProcessorTest, testCompactRawLogprobsAccumulateForNonStr
     ASSERT_TRUE(output.token_logprobs.has_value());
     ASSERT_TRUE(output.top_logprob_token_ids.has_value());
     ASSERT_TRUE(output.top_logprobs.has_value());
+    EXPECT_EQ(output.logprobs_offset, 0);
+    EXPECT_EQ(output.logprobs_count, 2);
 
     auto step1_logprobs    = torch::log_softmax(step1_logits, -1);
     auto step2_logprobs    = torch::log_softmax(step2_logits, -1);
@@ -427,6 +432,115 @@ TEST_F(NormalBatchStreamProcessorTest, testCompactRawLogprobsKZeroReturnsSelecte
     EXPECT_EQ(output.top_logprob_token_ids.value().sizes(), (torch::IntArrayRef{1, 0}));
     EXPECT_EQ(output.top_logprobs.value().sizes(), (torch::IntArrayRef{1, 0}));
     expectFloatTensorNear(output.token_logprobs.value(), torch::log_softmax(logits, -1)[0][1].reshape({1}));
+}
+
+TEST_F(NormalBatchStreamProcessorTest, testThinkingSkipsRawLogprobsUntilAfterFirstCloseToken) {
+    auto model_config = makeLogprobsModelConfig();
+    auto processor    = makeLogprobsProcessor(model_config);
+    auto stream       = makeLogprobsStream(
+        model_config, true, 0, 4, true, /*stop_words_list=*/{}, /*in_think_mode=*/true, /*end=*/{2, 3});
+    GptModelInputs model_inputs;
+
+    const auto run_step = [&](const torch::Tensor& logits, int32_t sampled_token, bool expect_raw_snapshot) {
+        StreamGroups    stream_groups({stream});
+        GptModelOutputs model_output;
+        model_output.logits = logits.to(torch::kCUDA);
+        auto sampler_input  = processor->gatherSamplerInput(stream_groups, model_inputs, model_output);
+        ASSERT_TRUE(sampler_input.ok());
+        EXPECT_EQ(sampler_input->raw_logprobs_logits.defined(), expect_raw_snapshot);
+        EXPECT_EQ(sampler_input->raw_logprobs_row_indices.defined(), expect_raw_snapshot);
+
+        MergedOutput outputs;
+        outputs.model_output                            = model_output;
+        outputs.sampler_output.token_ids                = torch::tensor({{sampled_token}}, torch::kInt32);
+        outputs.sampler_output.raw_logprobs_logits      = sampler_input->raw_logprobs_logits;
+        outputs.sampler_output.raw_logprobs_row_indices = sampler_input->raw_logprobs_row_indices;
+        ASSERT_TRUE(processor->dispatch(stream_groups, outputs).ok());
+    };
+
+    auto reasoning_logits = torch::tensor({4.0f, 3.0f, 2.0f, 1.0f}, torch::kFloat32).reshape({1, 4});
+    run_step(reasoning_logits, 1, false);
+    auto reasoning_result = stream->nextOutput();
+    ASSERT_TRUE(reasoning_result.ok());
+    const auto& reasoning_output = reasoning_result.value().generate_outputs[0];
+    EXPECT_EQ(toVec<int32_t>(reasoning_output.output_ids), (std::vector<int32_t>{1}));
+    EXPECT_EQ(reasoning_output.logprobs_offset, 1);
+    EXPECT_EQ(reasoning_output.logprobs_count, 0);
+    EXPECT_FALSE(reasoning_output.token_logprobs.has_value());
+    EXPECT_FALSE(stream->getTokenLogProbs().defined());
+    EXPECT_FALSE(stream->hasLogprobsContentStarted());
+
+    auto close_logits = torch::tensor({1.0f, 2.0f, 4.0f, 3.0f}, torch::kFloat32).reshape({1, 4});
+    run_step(close_logits, 2, false);
+    auto close_result = stream->nextOutput();
+    ASSERT_TRUE(close_result.ok());
+    const auto& close_output = close_result.value().generate_outputs[0];
+    EXPECT_EQ(toVec<int32_t>(close_output.output_ids), (std::vector<int32_t>{2}));
+    EXPECT_EQ(close_output.logprobs_offset, 1);
+    EXPECT_EQ(close_output.logprobs_count, 0);
+    EXPECT_FALSE(close_output.token_logprobs.has_value());
+    EXPECT_FALSE(stream->getTokenLogProbs().defined());
+    EXPECT_TRUE(stream->hasLogprobsContentStarted());
+
+    // The next decode row is captured. It is the tail of the textual close
+    // delimiter, but DashScope's content logprobs begin immediately after the
+    // first close token.
+    auto content_logits = torch::tensor({0.0f, 1.0f, 2.0f, 4.0f}, torch::kFloat32).reshape({1, 4});
+    run_step(content_logits, 3, true);
+    auto content_result = stream->nextOutput();
+    ASSERT_TRUE(content_result.ok());
+    const auto& content_output = content_result.value().generate_outputs[0];
+    EXPECT_EQ(toVec<int32_t>(content_output.output_ids), (std::vector<int32_t>{3}));
+    EXPECT_EQ(content_output.logprobs_offset, 0);
+    EXPECT_EQ(content_output.logprobs_count, 1);
+    ASSERT_TRUE(content_output.token_logprobs.has_value());
+    ASSERT_TRUE(content_output.top_logprob_token_ids.has_value());
+    ASSERT_TRUE(content_output.top_logprobs.has_value());
+    EXPECT_EQ(content_output.top_logprobs.value().sizes(), (torch::IntArrayRef{1, 0}));
+    expectFloatTensorNear(content_output.token_logprobs.value(),
+                          torch::log_softmax(content_logits, -1)[0][3].reshape({1}));
+    ASSERT_TRUE(stream->getTokenLogProbs().defined());
+    EXPECT_EQ(stream->logprobs_history_size_, 1);
+}
+
+TEST_F(NormalBatchStreamProcessorTest, testThinkingBoundaryPacketReturnsCompactContentLogprobs) {
+    auto model_config = makeLogprobsModelConfig();
+    auto stream       = makeLogprobsStream(
+        model_config, true, 0, 4, false, /*stop_words_list=*/{}, /*in_think_mode=*/true, /*end=*/{2, 3});
+
+    auto token_logprobs        = torch::tensor({{-0.3f, -0.4f}}, torch::kFloat32);
+    auto top_logprob_token_ids = torch::empty({1, 2, 0}, torch::kInt32);
+    auto top_logprobs          = torch::empty({1, 2, 0}, torch::kFloat32);
+    stream->update({torch::tensor({{1, 2, 3, 0}}, torch::kInt32),
+                    4,
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    true,
+                    false,
+                    token_logprobs,
+                    top_logprob_token_ids,
+                    top_logprobs,
+                    -1,
+                    2});
+
+    auto output_result = stream->nextOutput();
+    ASSERT_TRUE(output_result.ok());
+    const auto& output = output_result.value().generate_outputs[0];
+    EXPECT_EQ(toVec<int32_t>(output.output_ids), (std::vector<int32_t>{1, 2, 3, 0}));
+    EXPECT_EQ(output.logprobs_offset, 2);
+    EXPECT_EQ(output.logprobs_count, 2);
+    ASSERT_TRUE(output.token_logprobs.has_value());
+    ASSERT_TRUE(output.top_logprob_token_ids.has_value());
+    ASSERT_TRUE(output.top_logprobs.has_value());
+    expectFloatTensorNear(output.token_logprobs.value(), token_logprobs.reshape({2}));
+    EXPECT_EQ(output.top_logprobs.value().sizes(), (torch::IntArrayRef{2, 0}));
+    EXPECT_TRUE(stream->hasLogprobsContentStarted());
 }
 
 TEST_F(NormalBatchStreamProcessorTest, testCudaLogprobsRowReductionKZeroMixedBatchAndPaddedVocab) {

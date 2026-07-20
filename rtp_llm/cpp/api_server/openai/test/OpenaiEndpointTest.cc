@@ -189,6 +189,13 @@ TEST_F(OpenaiEndpointTest, ExtractGenerationConfig) {
     extra_top_without_logprobs_config.top_logprobs = 1;
     extra_top_without_logprobs.extra_configs       = extra_top_without_logprobs_config;
     EXPECT_THROW(openai_endpoint->extract_generation_config(extra_top_without_logprobs), std::exception);
+
+    ChatCompletionRequest thinking_logprobs;
+    GenerateConfig        thinking_logprobs_config;
+    thinking_logprobs_config.return_logprobs = true;
+    thinking_logprobs_config.in_think_mode   = true;
+    thinking_logprobs.extra_configs          = thinking_logprobs_config;
+    EXPECT_THROW(openai_endpoint->extract_generation_config(thinking_logprobs), std::exception);
 }
 
 TEST_F(OpenaiEndpointTest, GetChatRender) {

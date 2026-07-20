@@ -1251,19 +1251,52 @@ def _append_dashllm_limit_parameters(
         )
 
 
+def _placeholder_top_token_ids(token_id: int, width: int) -> list[int]:
+    """Return one sampled-token-first row for a positional placeholder."""
+    candidates = [int(token_id)]
+    candidate = 0
+    while len(candidates) < width:
+        if candidate != token_id:
+            candidates.append(candidate)
+        candidate += 1
+    return candidates
+
+
+def _placeholder_top_logprob_tensors(
+    generated_ids: list[int],
+    width: int,
+    *,
+    id_dtype: torch.dtype = torch.int32,
+    prob_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ids = torch.tensor(
+        [_placeholder_top_token_ids(token_id, width) for token_id in generated_ids],
+        dtype=id_dtype,
+    ).reshape(len(generated_ids), width)
+    probs = torch.full(
+        (len(generated_ids), width),
+        -float("inf"),
+        dtype=prob_dtype,
+    )
+    if generated_ids and width:
+        probs[:, 0] = 0.0
+    return ids, probs
+
+
 def _append_forced_token_logprob_outputs(
     infer: predict_v2_pb2.ModelInferResponse,
     *,
     generated_ids: list[int],
     generate_config: Any,
 ) -> None:
-    """Encode deterministic tokens inserted by the thinking controller.
+    """Encode positional placeholders for tokens outside normal content.
 
-    Once the thinking budget is exhausted, the logits processor constrains the
-    next positions to the configured closing delimiter.  Their probability in
-    that post-constraint sampling distribution is one, hence logprob ``0``.
-    Encoding those rows keeps the terminal frame aligned and prevents a
-    logprob-less synthetic frame from clearing the accumulated Dash response.
+    DashScope accumulates token ids and logprob rows in parallel, then slices
+    the accumulated rows at the reasoning/content boundary.  Reasoning and
+    controller-inserted tokens therefore still need one alignment row each,
+    even though their model probability is intentionally not exposed.  A
+    sampled-token-first ``0.0`` row is an alignment marker, not a reported
+    model probability.
     """
     if not bool(getattr(generate_config, "return_logprobs", False)):
         return
@@ -1279,23 +1312,19 @@ def _append_forced_token_logprob_outputs(
         tensor=token_values,
     )
     requested_k = int(getattr(generate_config, "top_logprobs", 0) or 0)
-    padding_ids = list(range(max(0, requested_k - 1)))
+    wire_ids, wire_values = _placeholder_top_logprob_tensors(
+        generated_ids, max(1, requested_k)
+    )
     wire_rows = [
         {
-            str(token_id): 0.0,
-            **{str(padding_id): -float("inf") for padding_id in padding_ids},
+            str(candidate_id): float(candidate_logprob)
+            for candidate_id, candidate_logprob in zip(id_row, prob_row)
         }
-        for token_id in generated_ids
+        for id_row, prob_row in zip(wire_ids.tolist(), wire_values.tolist())
     ]
     if requested_k > 0:
-        top_ids = torch.tensor(
-            [[token_id, *padding_ids] for token_id in generated_ids],
-            dtype=torch.int32,
-        )
-        top_values = torch.tensor(
-            [[0.0, *([-float("inf")] * len(padding_ids))] for _ in generated_ids],
-            dtype=torch.float32,
-        )
+        top_ids = wire_ids[:, :requested_k]
+        top_values = wire_values[:, :requested_k]
         _append_tensor_output(
             infer,
             tensor_name="top_logprob_token_ids",
@@ -1505,25 +1534,81 @@ def _append_logprob_outputs(
     generated_ids: list[int],
     num_tokens: int,
     generate_config: Any,
+    placeholder_prefix_token_count: int = 0,
 ) -> None:
-    """Encode compact per-token logprob tensors on the DashScope wire.
+    """Expand compact content logprobs into the aligned DashScope wire form.
 
-    Shapes retain the response batch dimension used by ``generated_ids``:
-    ``token_logprobs [1,L]`` and the two top-k tensors ``[1,L,K]``.
+    RTP-LLM carries only real rows for
+    ``output_ids[logprobs_offset:logprobs_offset + logprobs_count]``.  This is
+    the sole boundary that materializes positional placeholders for the
+    preceding thinking/controller tokens. Legacy aligned backend tensors are
+    still accepted during rolling upgrades.
     """
     token_logprobs = getattr(out_py, "token_logprobs", None)
     top_token_ids = getattr(out_py, "top_logprob_token_ids", None)
     top_logprobs = getattr(out_py, "top_logprobs", None)
     requested = bool(getattr(generate_config, "return_logprobs", False))
     requested_k = int(getattr(generate_config, "top_logprobs", 0) or 0)
+    placeholder_prefix_token_count = int(placeholder_prefix_token_count)
+    if not 0 <= placeholder_prefix_token_count <= num_tokens:
+        raise ValueError(
+            "placeholder_prefix_token_count must be between 0 and the number "
+            f"of output tokens: got {placeholder_prefix_token_count} for {num_tokens}"
+        )
 
     if not requested:
         return
 
+    raw_offset = getattr(out_py, "logprobs_offset", None)
+    raw_count = getattr(out_py, "logprobs_count", None)
+    has_compact_placement = raw_offset is not None or raw_count is not None
+    if has_compact_placement and (raw_offset is None or raw_count is None):
+        raise ValueError("logprobs_offset and logprobs_count must be provided together")
+
+    if has_compact_placement:
+        logprobs_offset = int(raw_offset)
+        logprobs_count = int(raw_count)
+        if (
+            logprobs_offset < 0
+            or logprobs_count < 0
+            or logprobs_offset + logprobs_count != num_tokens
+        ):
+            raise ValueError(
+                "compact logprobs must cover one output_ids suffix: "
+                f"offset={logprobs_offset}, count={logprobs_count}, "
+                f"tokens={num_tokens}"
+            )
+        if (
+            placeholder_prefix_token_count
+            and placeholder_prefix_token_count != logprobs_offset
+        ):
+            raise ValueError(
+                "DashSC thinking boundary disagrees with backend logprob "
+                f"placement: dashsc={placeholder_prefix_token_count}, "
+                f"backend={logprobs_offset}"
+            )
+        real_row_count = logprobs_count
+    else:
+        # Legacy responses have one backend row per id. The servicer-provided
+        # boundary marks which aligned prefix rows must be replaced.
+        logprobs_offset = placeholder_prefix_token_count
+        real_row_count = num_tokens
+
     if token_logprobs is None:
         if top_token_ids is not None or top_logprobs is not None:
             raise ValueError("top-logprob tensors require token_logprobs")
-        if requested and num_tokens:
+        if (
+            has_compact_placement
+            and logprobs_offset == num_tokens
+            and not real_row_count
+        ):
+            _append_forced_token_logprob_outputs(
+                infer,
+                generated_ids=generated_ids,
+                generate_config=generate_config,
+            )
+            return
+        if num_tokens:
             raise ValueError(
                 "token_logprobs is missing for a DashScope logprobs request"
             )
@@ -1533,14 +1618,26 @@ def _append_logprob_outputs(
         token_logprobs,
         top_token_ids,
         top_logprobs,
-        num_tokens=num_tokens,
+        num_tokens=real_row_count,
     )
 
-    token_values = _normalize_token_logprobs_tensor(
+    real_token_values = _normalize_token_logprobs_tensor(
         token_logprobs,
         tensor_name="token_logprobs",
-        num_tokens=num_tokens,
+        num_tokens=real_row_count,
     )
+    if has_compact_placement:
+        token_values = torch.cat(
+            [
+                torch.zeros(logprobs_offset, dtype=torch.float32),
+                real_token_values,
+            ]
+        )
+    else:
+        token_values = real_token_values
+        if logprobs_offset:
+            token_values = token_values.clone()
+            token_values[:logprobs_offset] = 0.0
     _append_tensor_output(
         infer,
         tensor_name="token_logprobs",
@@ -1577,13 +1674,13 @@ def _append_logprob_outputs(
     top_id_values = _normalize_top_logprobs_tensor(
         top_token_ids,
         tensor_name="top_logprob_token_ids",
-        num_tokens=num_tokens,
+        num_tokens=real_row_count,
         floating_point=False,
     )
     top_prob_values = _normalize_top_logprobs_tensor(
         top_logprobs,
         tensor_name="top_logprobs",
-        num_tokens=num_tokens,
+        num_tokens=real_row_count,
         floating_point=True,
     )
     if top_id_values.shape != top_prob_values.shape:
@@ -1596,6 +1693,30 @@ def _append_logprob_outputs(
             f"backend returned top_logprobs={actual_k}, exceeding requested "
             f"top_logprobs={requested_k}"
         )
+    if has_compact_placement:
+        if actual_k > 0:
+            prefix_top_ids, prefix_top_probs = _placeholder_top_logprob_tensors(
+                generated_ids[:logprobs_offset],
+                actual_k,
+                id_dtype=top_id_values.dtype,
+                prob_dtype=top_prob_values.dtype,
+            )
+            top_id_values = torch.cat([prefix_top_ids, top_id_values], dim=0)
+            top_prob_values = torch.cat([prefix_top_probs, top_prob_values], dim=0)
+        else:
+            top_id_values = torch.empty((num_tokens, 0), dtype=top_id_values.dtype)
+            top_prob_values = torch.empty((num_tokens, 0), dtype=top_prob_values.dtype)
+    elif logprobs_offset and actual_k > 0:
+        top_id_values = top_id_values.clone()
+        top_prob_values = top_prob_values.clone()
+        prefix_top_ids, prefix_top_probs = _placeholder_top_logprob_tensors(
+            generated_ids[:logprobs_offset],
+            actual_k,
+            id_dtype=top_id_values.dtype,
+            prob_dtype=top_prob_values.dtype,
+        )
+        top_id_values[:logprobs_offset] = prefix_top_ids
+        top_prob_values[:logprobs_offset] = prefix_top_probs
     for token_index in range(num_tokens):
         for top_index in range(actual_k):
             wire_logprobs[token_index][
@@ -1632,6 +1753,7 @@ def _log_dashsc_logprob_frame(
     pre_content_token_count: int | None,
     include_logprobs: bool,
     include_forced_token_logprobs: bool,
+    placeholder_prefix_token_count: int,
     finished: bool,
 ) -> None:
     """Log backend-to-wire logprob counts for one DashScope response frame."""
@@ -1641,15 +1763,20 @@ def _log_dashsc_logprob_frame(
     if not logger.isEnabledFor(logging.DEBUG):
         return
     try:
-        source = (
-            "backend"
-            if include_logprobs
-            else "forced" if include_forced_token_logprobs else "none"
-        )
+        backend_placement_offset = getattr(out_py, "logprobs_offset", None)
+        source = "none"
+        if include_logprobs:
+            source = (
+                "backend_compact_with_placeholder_prefix"
+                if backend_placement_offset or placeholder_prefix_token_count
+                else "backend"
+            )
+        elif include_forced_token_logprobs:
+            source = "placeholder"
         backend_generated_ids = _token_ids_list_from_generate_output(out_py)
         backend_token_logprob_rows: int | None = None
         backend_token_logprobs = getattr(out_py, "token_logprobs", None)
-        if source == "backend" and backend_token_logprobs is not None:
+        if include_logprobs and backend_token_logprobs is not None:
             try:
                 backend_token_logprob_rows = _logprob_token_rows(
                     backend_token_logprobs,
@@ -1686,6 +1813,17 @@ def _log_dashsc_logprob_frame(
 
         token_count = len(generated_ids)
         wire_count = len(wire_rows)
+        effective_prefix_count = (
+            int(backend_placement_offset)
+            if include_logprobs and backend_placement_offset is not None
+            else int(placeholder_prefix_token_count)
+        )
+        placeholder_rows = (
+            token_count
+            if include_forced_token_logprobs
+            else min(max(effective_prefix_count, 0), token_count)
+        )
+        real_rows = max(0, wire_count - placeholder_rows)
         aligned = token_count == wire_count and (
             wire_tensor_logprob_rows == token_count
             or (token_count == 0 and wire_tensor_logprob_rows is None)
@@ -1706,6 +1844,7 @@ def _log_dashsc_logprob_frame(
             "finished=%s backend_token_count=%s backend_token_logprob_rows=%s "
             "wire_token_count=%s wire_tensor_logprob_rows=%s "
             "wire_json_logprob_rows=%s aligned=%s sampled_tokens_match=%s "
+            "placeholder_logprob_rows=%s real_logprob_rows=%s "
             "pre_content_token_count=%s content_token_count=%s "
             "generate_think_token_num=%s top_logprobs=%s "
             "token_ids_preview=%s wire_parse_error=%s",
@@ -1721,6 +1860,8 @@ def _log_dashsc_logprob_frame(
             wire_count,
             aligned,
             sampled_tokens_match,
+            placeholder_rows,
+            real_rows,
             pre_content_count,
             content_count,
             generate_think_token_num,
@@ -1756,6 +1897,7 @@ def build_stream_response_from_generate_outputs(
     token_ids: list[int] | None = None,
     include_logprobs: bool = True,
     include_forced_token_logprobs: bool = False,
+    logprob_placeholder_prefix_token_count: int = 0,
     logprob_phase: str = "unspecified",
     logprob_pre_content_token_count: int | None = None,
     debug: bool = False,
@@ -1772,8 +1914,12 @@ def build_stream_response_from_generate_outputs(
     ``include_logprobs``: encode probability tensors from the backend output.
     Prompt-echo frames disable this because those ids were not sampled.
 
-    ``include_forced_token_logprobs``: encode deterministic logprob-zero rows
-    for a thinking delimiter inserted by the constraint controller.
+    ``include_forced_token_logprobs``: encode logprob-zero alignment rows for
+    a frame containing only non-content tokens.
+
+    ``logprob_placeholder_prefix_token_count``: replace this many leading
+    backend rows with alignment placeholders for a reasoning/content boundary
+    frame.  The remaining suffix keeps its real backend probabilities.
 
     ``logprob_phase`` / ``logprob_pre_content_token_count`` annotate only the
     diagnostic log. The latter counts this frame's reasoning and delimiter
@@ -1828,6 +1974,7 @@ def build_stream_response_from_generate_outputs(
             generated_ids=generated_ids,
             num_tokens=len(generated_ids),
             generate_config=generate_config,
+            placeholder_prefix_token_count=logprob_placeholder_prefix_token_count,
         )
     elif include_forced_token_logprobs:
         _append_forced_token_logprob_outputs(
@@ -1856,6 +2003,7 @@ def build_stream_response_from_generate_outputs(
         pre_content_token_count=logprob_pre_content_token_count,
         include_logprobs=include_logprobs,
         include_forced_token_logprobs=include_forced_token_logprobs,
+        placeholder_prefix_token_count=logprob_placeholder_prefix_token_count,
         finished=bool(finished),
     )
 

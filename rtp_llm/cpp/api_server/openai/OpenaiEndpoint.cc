@@ -88,6 +88,13 @@ std::shared_ptr<GenerateConfig> OpenaiEndpoint::extract_generation_config(const 
     if (config.return_logprobs && (effective_num_return_sequences > 1 || config.hasNumBeams())) {
         throw std::invalid_argument("logprobs does not support n > 1 or beam search");
     }
+    // The C++ OpenAI response ABI expects one row per visible output token and
+    // cannot represent RTP-LLM's compact content-only suffix. DashSC consumes
+    // the compact offset/count metadata directly and is unaffected by this
+    // endpoint check.
+    if (config.return_logprobs && config.in_think_mode) {
+        throw std::invalid_argument("logprobs is not supported when thinking output is enabled");
+    }
     std::vector<std::string> request_stop_words_list;
     if (req.stop.has_value()) {
         auto stop = req.stop.value();

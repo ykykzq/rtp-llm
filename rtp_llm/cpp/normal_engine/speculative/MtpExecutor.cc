@@ -486,16 +486,13 @@ collectMtpPrefillLogprobRows(const StreamGroups& stream_groups, int64_t position
     std::vector<int64_t> requested_rows;
     requested_rows.reserve(logits_rows);
 
-    int64_t row_offset     = 0;
-    bool    every_row_used = true;
+    int64_t row_offset = 0;
     for (const auto& stream : stream_groups.allStreams()) {
         const int64_t row_count = static_cast<int64_t>(stream->nextBatchSize()) * positions_per_batch;
-        if (stream->generateConfig()->return_logprobs) {
+        if (stream->shouldComputeLogprobs()) {
             for (int64_t row = 0; row < row_count; ++row) {
                 requested_rows.push_back(row_offset + row);
             }
-        } else {
-            every_row_used = false;
         }
         row_offset += row_count;
     }
@@ -504,9 +501,10 @@ collectMtpPrefillLogprobRows(const StreamGroups& stream_groups, int64_t position
                             row_offset,
                             logits_rows);
 
-    // Prefill finalizes before leaving the step, so mixed rows may be compacted
-    // here. Preserve the zero-copy identity mapping when every row is used.
-    return every_row_used ? std::vector<int64_t>{} : requested_rows;
+    // Unlike captureMtpTargetLogprobs's empty identity sentinel, this helper's
+    // empty result means that no prefill row belongs to content.  The caller
+    // skips target-logprob capture entirely in that case.
+    return requested_rows;
 }
 
 void validateMtpTargetLogprobRows(const MtpTargetLogprobs&    target_logprobs,
@@ -796,8 +794,24 @@ void finalizeSelectedMtpTargetLogprobs(MtpTargetLogprobs&          target_logpro
     RTP_LLM_CHECK(!target_logprobs.top_logits.defined());
     RTP_LLM_CHECK(!target_logprobs.top_logprob_token_ids.defined());
     RTP_LLM_CHECK(emitted_token_ids.defined());
-    RTP_LLM_CHECK_WITH_INFO(!selected_dense_row_indices.empty(),
-                            "accepted MTP logprob finalization requires at least one selected row");
+
+    // A decode packet may contain only reasoning tokens.  Treat that as a
+    // successfully finalized empty payload: no logsumexp/top-k kernel is
+    // launched and, crucially, the zero-copy raw LM-head owner is released as
+    // soon as rejection sampling has finished with it.
+    if (selected_dense_row_indices.empty()) {
+        const int64_t top_k            = target_logprobs.requested_top_logprobs;
+        auto          fp32_options     = target_logprobs.raw_logits.options().dtype(torch::kFloat32);
+        target_logprobs.token_logprobs = torch::empty({0}, fp32_options);
+        target_logprobs.top_logprob_token_ids =
+            torch::empty({0, top_k}, target_logprobs.raw_logits.options().dtype(torch::kInt32));
+        target_logprobs.top_logprobs                 = torch::empty({0, top_k}, fp32_options);
+        target_logprobs.raw_logits                   = torch::Tensor();
+        target_logprobs.source_row_indices           = torch::Tensor();
+        target_logprobs.retains_full_lm_head_storage = false;
+        RTP_LLM_CHECK(target_logprobs.finalized());
+        return;
+    }
 
     // raw_logits may already contain only the requesting streams. Align the
     // dense emitted-token matrix to that compact capture first, then translate
@@ -1581,13 +1595,23 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             }
             model_input.last_hidden_states = model_output.all_hidden_states;
         } else {
-            if (stream_groups.needReturnLogProbs()) {
-                target_logprobs = computeMtpTargetLogprobs(model_output.logits,
-                                                           stream_groups.maxTopLogProbs(),
-                                                           static_cast<int64_t>(vocab_size_),
-                                                           collectMtpPrefillLogprobRows(stream_groups,
-                                                                                        /*positions_per_batch=*/1,
-                                                                                        model_output.logits.size(0)));
+            const auto prefill_logprob_rows = stream_groups.needReturnLogProbs() ?
+                                                  collectMtpPrefillLogprobRows(stream_groups,
+                                                                               /*positions_per_batch=*/1,
+                                                                               model_output.logits.size(0)) :
+                                                  std::vector<int64_t>{};
+            if (!prefill_logprob_rows.empty()) {
+                // captureMtpTargetLogprobs uses an empty row vector as its
+                // identity sentinel.  Preserve that fast path only when every
+                // model row is content; an actually empty content selection
+                // is handled above by skipping capture altogether.
+                const bool every_row_is_content =
+                    static_cast<int64_t>(prefill_logprob_rows.size()) == model_output.logits.size(0);
+                target_logprobs =
+                    computeMtpTargetLogprobs(model_output.logits,
+                                             maxMtpActiveContentTopLogprobs(stream_groups),
+                                             static_cast<int64_t>(vocab_size_),
+                                             every_row_is_content ? std::vector<int64_t>{} : prefill_logprob_rows);
             }
             CHECK_AND_RETURN_REF(sampler_input,
                                  batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
@@ -1598,10 +1622,15 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
                 RTP_LLM_CHECK_WITH_INFO(
                     sampler_output.raw_logprobs_logits.defined(),
                     "MTP prefill logprobs require the sampler's pre-processing raw logits snapshot");
+                // Sparse content capture owns an immutable [content_rows,V]
+                // copy already.  The sampler snapshot is batch-compacted by
+                // return_logprobs rather than by content phase, so it is only
+                // shape-aligned with the identity/all-content path.
+                const bool identity_capture = target_logprobs.captured_dense_row_indices.empty();
                 finalizeMtpTargetLogprobs(
                     target_logprobs,
                     sampler_output.token_ids.select(/*dim=*/1, sampler_output.token_ids.size(1) - 1),
-                    sampler_output.raw_logprobs_logits);
+                    identity_capture ? sampler_output.raw_logprobs_logits : torch::Tensor());
             }
             // Restore the full combo_tokens / input_lengths before the MTP
             // shift logic — under CP both were mutated to rank-local by the

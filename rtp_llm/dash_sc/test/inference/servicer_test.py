@@ -25,6 +25,7 @@ from rtp_llm.dash_sc.access_record import GrpcAccessRecord
 from rtp_llm.dash_sc.codec import DashScParameterError, OtherParams, SamplingParams
 from rtp_llm.dash_sc.inference.servicer import (
     DashScInferenceServicer,
+    _slice_generate_output_token_span,
     build_think_runtime,
     iter_real_model_stream_infer,
 )
@@ -208,6 +209,44 @@ def _assert_parameter_error_response(
 
 
 class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
+    def test_compact_logprob_slice_updates_offset_count_and_tensor_rows(self):
+        out = GenerateOutput(
+            output_ids=torch.tensor([10, 11, 128822, 271, 20], dtype=torch.int32),
+            token_logprobs=torch.tensor([-0.13, -0.20], dtype=torch.float32),
+            top_logprob_token_ids=torch.tensor([[271], [20]], dtype=torch.int32),
+            top_logprobs=torch.tensor([[-0.13], [-0.20]], dtype=torch.float32),
+            logprobs_offset=3,
+            logprobs_count=2,
+        )
+
+        selected = _slice_generate_output_token_span(out, 2, 5)
+
+        self.assertEqual(selected, [128822, 271, 20])
+        self.assertEqual(out.output_ids.tolist(), [128822, 271, 20])
+        self.assertEqual(out.logprobs_offset, 1)
+        self.assertEqual(out.logprobs_count, 2)
+        self.assertTrue(
+            torch.equal(
+                out.token_logprobs,
+                torch.tensor([-0.13, -0.20], dtype=torch.float32),
+            )
+        )
+        self.assertEqual(out.top_logprob_token_ids.tolist(), [[271], [20]])
+
+        thinking_only = GenerateOutput(
+            output_ids=torch.tensor([10, 11, 128822, 271, 20], dtype=torch.int32),
+            token_logprobs=torch.tensor([-0.13, -0.20], dtype=torch.float32),
+            top_logprob_token_ids=torch.tensor([[271], [20]], dtype=torch.int32),
+            top_logprobs=torch.tensor([[-0.13], [-0.20]], dtype=torch.float32),
+            logprobs_offset=3,
+            logprobs_count=2,
+        )
+        _slice_generate_output_token_span(thinking_only, 0, 3)
+        self.assertEqual(thinking_only.logprobs_offset, 3)
+        self.assertEqual(thinking_only.logprobs_count, 0)
+        self.assertEqual(thinking_only.token_logprobs.numel(), 0)
+        self.assertEqual(tuple(thinking_only.top_logprobs.shape), (0, 1))
+
     def _minimal_request(self) -> predict_v2_pb2.ModelInferRequest:
         req = predict_v2_pb2.ModelInferRequest()
         req.id = "trace-real"
@@ -1503,8 +1542,9 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             visitor.generate_inputs[0].generate_config.max_thinking_tokens, 2
         )
-        # The echoed thinking BOS and injected close delimiter are both
-        # deterministic controller tokens and carry aligned logprob=0 rows.
+        # Thinking BOS, sampled reasoning, and the injected close delimiter
+        # carry alignment placeholders only. Their backend probabilities are
+        # intentionally not exposed; phase-2 content keeps the real values.
         self.assertEqual(_fp32_output(chunks[0], "token_logprobs"), [0.0])
         self.assertEqual(_int32_output(chunks[0], "top_logprob_token_ids"), [128821, 0])
         bos_top_logprobs = _fp32_output(chunks[0], "top_logprobs")
@@ -1512,6 +1552,18 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         assert bos_top_logprobs is not None
         self.assertEqual(bos_top_logprobs[0], 0.0)
         self.assertTrue(math.isinf(bos_top_logprobs[1]))
+        self.assertEqual(_fp32_output(chunks[1], "token_logprobs"), [0.0, 0.0])
+        self.assertEqual(
+            _int32_output(chunks[1], "top_logprob_token_ids"),
+            [10, 0, 11, 0],
+        )
+        thinking_top_logprobs = _fp32_output(chunks[1], "top_logprobs")
+        self.assertIsNotNone(thinking_top_logprobs)
+        assert thinking_top_logprobs is not None
+        self.assertEqual(thinking_top_logprobs[0], 0.0)
+        self.assertEqual(thinking_top_logprobs[2], 0.0)
+        self.assertTrue(math.isinf(thinking_top_logprobs[1]))
+        self.assertTrue(math.isinf(thinking_top_logprobs[3]))
         self.assertEqual(_fp32_output(chunks[2], "token_logprobs"), [0.0, 0.0])
         self.assertEqual(
             _int32_output(chunks[2], "top_logprob_token_ids"),
@@ -1526,7 +1578,6 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(math.isinf(close_top_logprobs[3]))
 
         expected = {
-            1: ([-0.10, -0.11], [10, 110, 11, 111]),
             3: ([-0.20], [20, 120]),
             4: ([-0.21], [21, 121]),
         }
@@ -1540,7 +1591,7 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
                 _int32_output(chunks[idx], "top_logprob_token_ids"), top_ids
             )
 
-    async def test_mtp5_natural_think_close_keeps_first_content_logprob(
+    async def test_mtp5_natural_think_close_masks_reasoning_logprobs(
         self,
     ) -> None:
         """An MTP batch may cross ``</think>`` into content in one response.
@@ -1548,22 +1599,24 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         Regression for the DashScope request with max_new_tokens=3,
         max_new_think_tokens=10 and top_logprobs=0: the first content token in
         the boundary-crossing five-token batch must retain its sampled
-        logprob. Deterministic prompt-echo tokens receive forced zero rows so
-        every emitted token remains positionally aligned.
+        logprob. Reasoning tokens receive zero-valued alignment placeholders,
+        while the close-following content suffix keeps its real probabilities.
         """
         req = self._minimal_request()
         boundary_batch = GenerateOutputs(
             generate_outputs=[
                 GenerateOutput(
-                    # Two reasoning tokens, the two-token close delimiter, and
-                    # the first content token arrive in one MTP-5 batch.
+                    # Two reasoning tokens, the close token, and two content
+                    # tokens (271 and 20) arrive in one MTP-5 batch.
                     output_ids=torch.tensor(
                         [10, 11, 128822, 271, 20], dtype=torch.int32
                     ),
                     token_logprobs=torch.tensor(
-                        [-0.10, -0.11, -0.12, -0.13, -0.20],
+                        [-0.13, -0.20],
                         dtype=torch.float32,
                     ),
+                    logprobs_offset=3,
+                    logprobs_count=2,
                     finished=False,
                     aux_info=AuxInfo(input_len=3, reuse_len=0),
                 )
@@ -1574,6 +1627,8 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
                 GenerateOutput(
                     output_ids=torch.tensor([21, 22], dtype=torch.int32),
                     token_logprobs=torch.tensor([-0.21, -0.22], dtype=torch.float32),
+                    logprobs_offset=0,
+                    logprobs_count=2,
                     finished=True,
                     aux_info=AuxInfo(input_len=3, reuse_len=0),
                 )
@@ -1632,16 +1687,15 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             [_gen_ids(chunk) for chunk in chunks],
             [[128821], [10, 11, 128822, 271, 20], [21, 22]],
         )
-        # The deterministic thinking-BOS echo also gets a probability row, so
-        # downstream slicing by generate_think_token_num cannot consume the
-        # first content token's logprob.
+        # The thinking-BOS echo gets an alignment row so downstream slicing by
+        # token position cannot consume the first content token's logprob.
         self.assertEqual(_fp32_output(chunks[0], "token_logprobs"), [0.0])
         echo_wire_rows = json.loads(
             chunks[0].infer_response.parameters["logprobs"].string_param
         )
         self.assertEqual(echo_wire_rows, [{"128821": 0.0}])
         expected_probs = (
-            [-0.10, -0.11, -0.12, -0.13, -0.20],
+            [0.0, 0.0, 0.0, -0.13, -0.20],
             [-0.21, -0.22],
         )
         for chunk, expected in zip(chunks[1:], expected_probs):
@@ -1658,6 +1712,19 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(wire_rows), len(ids))
             self.assertEqual([list(row) for row in wire_rows], [[str(i)] for i in ids])
+
+        boundary_wire_rows = json.loads(
+            chunks[1].infer_response.parameters["logprobs"].string_param
+        )
+        self.assertEqual(
+            [
+                boundary_wire_rows[i][str(token_id)]
+                for i, token_id in enumerate([10, 11, 128822])
+            ],
+            [0.0, 0.0, 0.0],
+        )
+        self.assertAlmostEqual(boundary_wire_rows[3]["271"], -0.13)
+        self.assertAlmostEqual(boundary_wire_rows[4]["20"], -0.20)
 
         all_ids = [token_id for chunk in chunks for token_id in _gen_ids(chunk)]
         all_wire_rows = [

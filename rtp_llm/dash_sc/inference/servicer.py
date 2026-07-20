@@ -422,7 +422,7 @@ def _slice_generate_output_token_span(
     start: int,
     end: int,
 ) -> list[int]:
-    """Apply one token-row slice to IDs and every compact logprob tensor."""
+    """Slice IDs and preserve compact-logprob placement within the new span."""
     source_ids = _token_ids_list_from_generate_output(out_py)
     num_tokens = len(source_ids)
     if not (0 <= start <= end <= num_tokens):
@@ -439,36 +439,73 @@ def _slice_generate_output_token_span(
         ids_tensor = output_ids[0] if output_ids.dim() > 1 else output_ids
         out_py.output_ids = ids_tensor[start:end].clone()
 
+    raw_logprobs_offset = getattr(out_py, "logprobs_offset", None)
+    raw_logprobs_count = getattr(out_py, "logprobs_count", None)
+    has_compact_placement = (
+        raw_logprobs_offset is not None or raw_logprobs_count is not None
+    )
+    compact_source_start = start
+    compact_source_end = end
+    if has_compact_placement:
+        if raw_logprobs_offset is None or raw_logprobs_count is None:
+            raise ValueError(
+                "logprobs_offset and logprobs_count must be provided together"
+            )
+        logprobs_offset = int(raw_logprobs_offset)
+        logprobs_count = int(raw_logprobs_count)
+        if (
+            logprobs_offset < 0
+            or logprobs_count < 0
+            or logprobs_offset + logprobs_count != num_tokens
+        ):
+            raise ValueError(
+                "compact logprobs must cover one output_ids suffix: "
+                f"offset={logprobs_offset}, count={logprobs_count}, "
+                f"tokens={num_tokens}"
+            )
+        sliced_token_count = end - start
+        sliced_logprobs_offset = min(
+            max(logprobs_offset - start, 0), sliced_token_count
+        )
+        sliced_logprobs_count = sliced_token_count - sliced_logprobs_offset
+        compact_source_start = max(start - logprobs_offset, 0)
+        compact_source_end = compact_source_start + sliced_logprobs_count
+        if compact_source_end > logprobs_count:
+            raise ValueError("compact logprob slice exceeds the source row count")
+        out_py.logprobs_offset = sliced_logprobs_offset
+        out_py.logprobs_count = sliced_logprobs_count
+
     for name in ("token_logprobs", "top_logprob_token_ids", "top_logprobs"):
         value = getattr(out_py, name, None)
         if value is None:
             continue
+        expected_rows = int(raw_logprobs_count) if has_compact_placement else num_tokens
         if name == "token_logprobs":
-            if value.dim() == 1 and value.shape[0] == num_tokens:
-                sliced = value[start:end]
+            if value.dim() == 1 and value.shape[0] == expected_rows:
+                sliced = value[compact_source_start:compact_source_end]
             elif (
                 value.dim() == 2
                 and value.shape[0] == 1
-                and value.shape[1] == num_tokens
+                and value.shape[1] == expected_rows
             ):
-                sliced = value[:, start:end]
+                sliced = value[:, compact_source_start:compact_source_end]
             else:
                 raise ValueError(
-                    f"{name} does not align with {num_tokens} output tokens: "
+                    f"{name} does not align with {expected_rows} compact rows: "
                     f"shape={tuple(value.shape)}"
                 )
         else:
-            if value.dim() == 2 and value.shape[0] == num_tokens:
-                sliced = value[start:end, :]
+            if value.dim() == 2 and value.shape[0] == expected_rows:
+                sliced = value[compact_source_start:compact_source_end, :]
             elif (
                 value.dim() == 3
                 and value.shape[0] == 1
-                and value.shape[1] == num_tokens
+                and value.shape[1] == expected_rows
             ):
-                sliced = value[:, start:end, :]
+                sliced = value[:, compact_source_start:compact_source_end, :]
             else:
                 raise ValueError(
-                    f"{name} does not align with {num_tokens} output tokens: "
+                    f"{name} does not align with {expected_rows} compact rows: "
                     f"shape={tuple(value.shape)}"
                 )
         setattr(out_py, name, sliced.clone())
@@ -844,10 +881,10 @@ async def iter_real_model_stream_infer(
                         and not echoed
                         and bool(getattr(generate_config, "return_logprobs", False))
                     ):
-                        # Echoed ids are the deterministic thinking BOS inserted
-                        # into the prompt. Keep them in their own frame, but emit
-                        # forced logprob-zero rows so downstream token/logprob
-                        # aggregation stays positionally aligned.
+                        # Echoed ids are the thinking BOS inserted into the
+                        # prompt. Keep them in their own frame and emit only
+                        # zero-valued alignment placeholders; reasoning
+                        # probabilities are not exposed downstream.
                         echo_response = build_stream_response_from_generate_outputs(
                             dash_sc_request_id=request.id,
                             model_name=request.model_name,
@@ -899,6 +936,8 @@ async def iter_real_model_stream_infer(
                         generate_think_token_num=generate_think_token_num,
                         _request_shape=request_shape,
                         stream_finished=False,
+                        include_logprobs=False,
+                        include_forced_token_logprobs=True,
                         logprob_phase="thinking",
                         logprob_pre_content_token_count=len(generated_ids),
                     )
@@ -1022,17 +1061,22 @@ async def iter_real_model_stream_infer(
             logprob_pre_content_token_count = 0
             if bool(getattr(generate_config, "in_think_mode", False)):
                 if close_offset is not None:
-                    _, post_close_start, post_close_ids = _split_on_first_close(
+                    close_index, _, _ = _split_on_first_close(
                         generated_ids,
                         think_close_token_id,
                         runtime.eos_tokens,
                     )
-                    logprob_pre_content_token_count = post_close_start
-                    logprob_phase = (
-                        "thinking_content_boundary"
-                        if post_close_ids
-                        else "thinking_close"
-                    )
+                    if close_index is not None:
+                        # DashScope starts content immediately after the close
+                        # token. Do not consume the remaining textual delimiter
+                        # here (for example token 271), because its output-id
+                        # index is already part of the content span downstream.
+                        logprob_pre_content_token_count = close_index + 1
+                        logprob_phase = (
+                            "thinking_content_boundary"
+                            if logprob_pre_content_token_count < len(generated_ids)
+                            else "thinking_close"
+                        )
                 elif generate_think_token_num is None:
                     logprob_phase = "thinking"
                     logprob_pre_content_token_count = len(generated_ids)
@@ -1051,6 +1095,10 @@ async def iter_real_model_stream_infer(
                 generate_think_token_num=generate_think_token_num,
                 finish_reason_override=finish_reason_override,
                 _request_shape=request_shape,
+                # Compact backends carry the authoritative content boundary.
+                # The phase-derived prefix is used only to mask legacy aligned
+                # responses that do not yet carry offset/count metadata.
+                logprob_placeholder_prefix_token_count=logprob_pre_content_token_count,
                 logprob_phase=logprob_phase,
                 logprob_pre_content_token_count=logprob_pre_content_token_count,
             )
