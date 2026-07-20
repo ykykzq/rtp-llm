@@ -1503,12 +1503,15 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             visitor.generate_inputs[0].generate_config.max_thinking_tokens, 2
         )
-        # Prompt echo is not sampled and has no probability payload. The
-        # injected close delimiter is deterministic under the think-budget
-        # constraint and therefore carries aligned logprob=0 rows.
-        self.assertIsNone(_fp32_output(chunks[0], "token_logprobs"))
-        self.assertIsNone(_int32_output(chunks[0], "top_logprob_token_ids"))
-        self.assertIsNone(_fp32_output(chunks[0], "top_logprobs"))
+        # The echoed thinking BOS and injected close delimiter are both
+        # deterministic controller tokens and carry aligned logprob=0 rows.
+        self.assertEqual(_fp32_output(chunks[0], "token_logprobs"), [0.0])
+        self.assertEqual(_int32_output(chunks[0], "top_logprob_token_ids"), [128821, 0])
+        bos_top_logprobs = _fp32_output(chunks[0], "top_logprobs")
+        self.assertIsNotNone(bos_top_logprobs)
+        assert bos_top_logprobs is not None
+        self.assertEqual(bos_top_logprobs[0], 0.0)
+        self.assertTrue(math.isinf(bos_top_logprobs[1]))
         self.assertEqual(_fp32_output(chunks[2], "token_logprobs"), [0.0, 0.0])
         self.assertEqual(
             _int32_output(chunks[2], "top_logprob_token_ids"),
@@ -1536,6 +1539,146 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 _int32_output(chunks[idx], "top_logprob_token_ids"), top_ids
             )
+
+    async def test_mtp5_natural_think_close_keeps_first_content_logprob(
+        self,
+    ) -> None:
+        """An MTP batch may cross ``</think>`` into content in one response.
+
+        Regression for the DashScope request with max_new_tokens=3,
+        max_new_think_tokens=10 and top_logprobs=0: the first content token in
+        the boundary-crossing five-token batch must retain its sampled
+        logprob. Deterministic prompt-echo tokens receive forced zero rows so
+        every emitted token remains positionally aligned.
+        """
+        req = self._minimal_request()
+        boundary_batch = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    # Two reasoning tokens, the two-token close delimiter, and
+                    # the first content token arrive in one MTP-5 batch.
+                    output_ids=torch.tensor(
+                        [10, 11, 128822, 271, 20], dtype=torch.int32
+                    ),
+                    token_logprobs=torch.tensor(
+                        [-0.10, -0.11, -0.12, -0.13, -0.20],
+                        dtype=torch.float32,
+                    ),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=3, reuse_len=0),
+                )
+            ]
+        )
+        content_tail = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([21, 22], dtype=torch.int32),
+                    token_logprobs=torch.tensor([-0.21, -0.22], dtype=torch.float32),
+                    finished=True,
+                    aux_info=AuxInfo(input_len=3, reuse_len=0),
+                )
+            ]
+        )
+        visitor = _FakeVisitor(_FakeAsyncStream([boundary_batch, content_tail]))
+        tok = _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+
+        # Exact generate_config requested by the regression case, split only
+        # along the SamplingParams/OtherParams ownership boundary.
+        sampling = SamplingParams(
+            max_new_tokens=3,
+            max_new_tokens_from_completion_alias=False,
+            max_total_tokens=None,
+            num_return_sequences=1,
+            top_p=0.949999988079071,
+            top_k=5,
+            temperature=1.0,
+            min_new_tokens=0,
+            random_seed=None,
+            repetition_penalty=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            return_logprobs=True,
+            top_logprobs=0,
+            stop_words_list=(),
+            max_new_think_tokens=10,
+            response_format=None,
+            json_format=False,
+            structural_tag=None,
+        )
+        other = OtherParams(
+            enable_thinking=True,
+            reasoning_effort=None,
+            timeout_ms=3_600_000,
+            traffic_reject_priority=10,
+        )
+
+        chunks = await _drain(
+            iter_real_model_stream_infer(
+                req,
+                [7, 8, 128821],
+                sampling,
+                other,
+                visitor,
+                rtp_llm_request_id=100,
+                echo_prefix_ids=[128821, 198],
+                tokenizer=tok,
+                generate_env_config=env_cfg,
+                think_runtime=build_think_runtime(tok, env_cfg, "glm4_moe"),
+            )
+        )
+
+        self.assertEqual(
+            [_gen_ids(chunk) for chunk in chunks],
+            [[128821], [10, 11, 128822, 271, 20], [21, 22]],
+        )
+        # The deterministic thinking-BOS echo also gets a probability row, so
+        # downstream slicing by generate_think_token_num cannot consume the
+        # first content token's logprob.
+        self.assertEqual(_fp32_output(chunks[0], "token_logprobs"), [0.0])
+        echo_wire_rows = json.loads(
+            chunks[0].infer_response.parameters["logprobs"].string_param
+        )
+        self.assertEqual(echo_wire_rows, [{"128821": 0.0}])
+        expected_probs = (
+            [-0.10, -0.11, -0.12, -0.13, -0.20],
+            [-0.21, -0.22],
+        )
+        for chunk, expected in zip(chunks[1:], expected_probs):
+            ids = _gen_ids(chunk)
+            probs = _fp32_output(chunk, "token_logprobs")
+            self.assertIsNotNone(probs)
+            assert probs is not None
+            self.assertEqual(len(probs), len(ids))
+            for got, want in zip(probs, expected):
+                self.assertAlmostEqual(got, want)
+
+            wire_rows = json.loads(
+                chunk.infer_response.parameters["logprobs"].string_param
+            )
+            self.assertEqual(len(wire_rows), len(ids))
+            self.assertEqual([list(row) for row in wire_rows], [[str(i)] for i in ids])
+
+        all_ids = [token_id for chunk in chunks for token_id in _gen_ids(chunk)]
+        all_wire_rows = [
+            row
+            for chunk in chunks
+            for row in json.loads(
+                chunk.infer_response.parameters["logprobs"].string_param
+            )
+        ]
+        self.assertEqual(len(all_wire_rows), len(all_ids))
+
+        config = visitor.last_generate_input.generate_config
+        self.assertEqual(config.max_new_tokens, 3)
+        self.assertEqual(config.num_return_sequences, 1)
+        self.assertAlmostEqual(config.top_p, 0.949999988079071)
+        self.assertEqual(config.top_k, 5)
+        self.assertTrue(config.return_logprobs)
+        self.assertEqual(config.top_logprobs, 0)
+        self.assertEqual(config.max_thinking_tokens, 10)
+        self.assertTrue(config.in_think_mode)
+        self.assertEqual(config.traffic_reject_priority, 10)
 
     async def test_phase2_pre_close_slice_keeps_matching_logprob_prefix(self) -> None:
         req = self._minimal_request()

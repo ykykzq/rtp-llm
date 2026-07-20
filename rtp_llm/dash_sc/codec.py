@@ -1620,6 +1620,123 @@ def _append_logprob_outputs(
     )
 
 
+def _log_dashsc_logprob_frame(
+    *,
+    infer: predict_v2_pb2.ModelInferResponse,
+    out_py: Any,
+    request_log_tag: str,
+    generated_ids: list[int],
+    generate_config: Any,
+    generate_think_token_num: int | None,
+    phase: str,
+    pre_content_token_count: int | None,
+    include_logprobs: bool,
+    include_forced_token_logprobs: bool,
+    finished: bool,
+) -> None:
+    """Log backend-to-wire logprob counts for one DashScope response frame."""
+    if not bool(getattr(generate_config, "return_logprobs", False)):
+        return
+    logger = logging.getLogger()
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        source = (
+            "backend"
+            if include_logprobs
+            else "forced" if include_forced_token_logprobs else "none"
+        )
+        backend_generated_ids = _token_ids_list_from_generate_output(out_py)
+        backend_token_logprob_rows: int | None = None
+        backend_token_logprobs = getattr(out_py, "token_logprobs", None)
+        if source == "backend" and backend_token_logprobs is not None:
+            try:
+                backend_token_logprob_rows = _logprob_token_rows(
+                    backend_token_logprobs,
+                    tensor_name="token_logprobs",
+                )
+            except (AttributeError, ValueError):
+                backend_token_logprob_rows = -1
+
+        wire_tensor_logprob_rows: int | None = None
+        for output in infer.outputs:
+            if output.name != "token_logprobs":
+                continue
+            shape = list(output.shape)
+            wire_tensor_logprob_rows = (
+                int(shape[1]) if len(shape) == 2 and shape[0] == 1 else -1
+            )
+            break
+
+        wire_rows: list[Any] = []
+        wire_parse_error: str | None = None
+        wire_param = infer.parameters.get("logprobs")
+        if (
+            wire_param is not None
+            and wire_param.WhichOneof("parameter_choice") == "string_param"
+        ):
+            try:
+                parsed = json.loads(wire_param.string_param)
+                if isinstance(parsed, list):
+                    wire_rows = parsed
+                else:
+                    wire_parse_error = f"decoded_{type(parsed).__name__}"
+            except (TypeError, json.JSONDecodeError) as error:
+                wire_parse_error = type(error).__name__
+
+        token_count = len(generated_ids)
+        wire_count = len(wire_rows)
+        aligned = token_count == wire_count and (
+            wire_tensor_logprob_rows == token_count
+            or (token_count == 0 and wire_tensor_logprob_rows is None)
+        )
+        sampled_tokens_match = token_count == wire_count and all(
+            isinstance(row, dict) and str(token_id) in row
+            for token_id, row in zip(generated_ids, wire_rows)
+        )
+        if pre_content_token_count is None:
+            pre_content_count = None
+            content_count = None
+        else:
+            pre_content_count = max(0, min(int(pre_content_token_count), token_count))
+            content_count = token_count - pre_content_count
+        logger.debug(
+            "[DashScGrpcLogprobs] [%s] stage=wire response_id=%s "
+            "phase=%s source=%s "
+            "finished=%s backend_token_count=%s backend_token_logprob_rows=%s "
+            "wire_token_count=%s wire_tensor_logprob_rows=%s "
+            "wire_json_logprob_rows=%s aligned=%s sampled_tokens_match=%s "
+            "pre_content_token_count=%s content_token_count=%s "
+            "generate_think_token_num=%s top_logprobs=%s "
+            "token_ids_preview=%s wire_parse_error=%s",
+            request_log_tag,
+            infer.id,
+            phase,
+            source,
+            finished,
+            len(backend_generated_ids),
+            backend_token_logprob_rows,
+            token_count,
+            wire_tensor_logprob_rows,
+            wire_count,
+            aligned,
+            sampled_tokens_match,
+            pre_content_count,
+            content_count,
+            generate_think_token_num,
+            int(getattr(generate_config, "top_logprobs", 0) or 0),
+            generated_ids[:4],
+            wire_parse_error,
+        )
+    except Exception as error:
+        # Observability must never change inference behavior.
+        logger.warning(
+            "[DashScGrpcLogprobs] [%s] stage=wire diagnostic_error=%s",
+            request_log_tag,
+            type(error).__name__,
+        )
+
+
 def build_stream_response_from_generate_outputs(
     dash_sc_request_id: str,
     model_name: str,
@@ -1639,6 +1756,8 @@ def build_stream_response_from_generate_outputs(
     token_ids: list[int] | None = None,
     include_logprobs: bool = True,
     include_forced_token_logprobs: bool = False,
+    logprob_phase: str = "unspecified",
+    logprob_pre_content_token_count: int | None = None,
     debug: bool = False,
 ) -> predict_v2_pb2.ModelStreamInferResponse:
     """Build ``ModelStreamInferResponse`` from one ``GenerateOutputs`` chunk.
@@ -1655,6 +1774,10 @@ def build_stream_response_from_generate_outputs(
 
     ``include_forced_token_logprobs``: encode deterministic logprob-zero rows
     for a thinking delimiter inserted by the constraint controller.
+
+    ``logprob_phase`` / ``logprob_pre_content_token_count`` annotate only the
+    diagnostic log. The latter counts this frame's reasoning and delimiter
+    tokens before normal content begins.
     """
     del _request_shape  # reserved for future shape alignment
     if not go.generate_outputs:
@@ -1720,6 +1843,20 @@ def build_stream_response_from_generate_outputs(
         max_token_id=max_token_id,
         generate_think_token_num=generate_think_token_num,
         debug=debug and finished,
+    )
+
+    _log_dashsc_logprob_frame(
+        infer=infer,
+        out_py=out_py,
+        request_log_tag=request_log_tag,
+        generated_ids=generated_ids,
+        generate_config=generate_config,
+        generate_think_token_num=generate_think_token_num,
+        phase=logprob_phase,
+        pre_content_token_count=logprob_pre_content_token_count,
+        include_logprobs=include_logprobs,
+        include_forced_token_logprobs=include_forced_token_logprobs,
+        finished=bool(finished),
     )
 
     logging.debug("[DashScGrpc] [%s] generated_ids: %s", request_log_tag, generated_ids)

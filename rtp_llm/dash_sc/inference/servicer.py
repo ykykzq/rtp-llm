@@ -15,6 +15,7 @@ coroutine automatically.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Iterator, Optional
@@ -41,6 +42,7 @@ from rtp_llm.dash_sc.codec import (
     iter_fake_model_stream_infer,
     parse_dash_sc_grpc_request,
     prepend_to_generated_ids_tensor,
+    unpack_int_tensor_flat,
 )
 from rtp_llm.dash_sc.grpc_metrics import (
     report_arrival,
@@ -94,6 +96,75 @@ def _set_access_backend_error_code(access_agg: Any, e: BaseException) -> None:
         access_agg.backend_error_code = _exception_metric_code(raw_code)
     except (TypeError, ValueError):
         access_agg.backend_error_code = str(raw_code)
+
+
+def _log_dashsc_grpc_egress_logprobs(
+    response: predict_v2_pb2.ModelStreamInferResponse,
+    *,
+    request_log_tag: str,
+    enabled: bool,
+    finished: bool,
+) -> None:
+    """Dump the exact token/logprob payload immediately before gRPC yield."""
+    if not enabled:
+        return
+    logger = logging.getLogger()
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        infer = response.infer_response
+        token_ids: list[int] | None = None
+        for index, output in enumerate(infer.outputs):
+            if output.name not in ("generated_ids", "token_ids"):
+                continue
+            raw = (
+                infer.raw_output_contents[index]
+                if index < len(infer.raw_output_contents)
+                else None
+            )
+            token_ids = unpack_int_tensor_flat(output.datatype, raw)
+            break
+
+        logprobs_json: str | None = None
+        logprob_rows: int | None = None
+        logprobs_param = infer.parameters.get("logprobs")
+        if (
+            logprobs_param is not None
+            and logprobs_param.WhichOneof("parameter_choice") == "string_param"
+        ):
+            logprobs_json = logprobs_param.string_param
+            parsed = json.loads(logprobs_json)
+            logprob_rows = len(parsed) if isinstance(parsed, list) else -1
+
+        generate_think_token_num: int | None = None
+        think_param = infer.parameters.get("generate_think_token_num")
+        if (
+            think_param is not None
+            and think_param.WhichOneof("parameter_choice") == "int64_param"
+        ):
+            generate_think_token_num = int(think_param.int64_param)
+
+        logger.debug(
+            "[DashScGrpcLogprobs] [%s] stage=grpc_egress response_id=%s "
+            "finished=%s token_count=%s logprob_rows=%s aligned=%s "
+            "generate_think_token_num=%s token_ids=%s logprobs=%s",
+            request_log_tag,
+            infer.id,
+            finished,
+            len(token_ids) if token_ids is not None else None,
+            logprob_rows,
+            token_ids is not None and len(token_ids) == logprob_rows,
+            generate_think_token_num,
+            token_ids,
+            logprobs_json,
+        )
+    except Exception as error:
+        # This diagnostic sits on the final send path and must never affect it.
+        logger.warning(
+            "[DashScGrpcLogprobs] [%s] stage=grpc_egress diagnostic_error=%s",
+            request_log_tag,
+            type(error).__name__,
+        )
 
 
 def stream_log_tag(
@@ -696,6 +767,8 @@ async def iter_real_model_stream_infer(
                     eos_token_id=eos_id,
                     max_token_id=max_id,
                     _request_shape=request_shape,
+                    logprob_phase="empty",
+                    logprob_pre_content_token_count=0,
                 )
                 stats = (
                     0,
@@ -771,9 +844,10 @@ async def iter_real_model_stream_infer(
                         and not echoed
                         and bool(getattr(generate_config, "return_logprobs", False))
                     ):
-                        # Echoed ids came from the prompt, not a model sample. Keep
-                        # them on the wire but put them in their own frame with no
-                        # fabricated logprob payload.
+                        # Echoed ids are the deterministic thinking BOS inserted
+                        # into the prompt. Keep them in their own frame, but emit
+                        # forced logprob-zero rows so downstream token/logprob
+                        # aggregation stays positionally aligned.
                         echo_response = build_stream_response_from_generate_outputs(
                             dash_sc_request_id=request.id,
                             model_name=request.model_name,
@@ -791,6 +865,9 @@ async def iter_real_model_stream_infer(
                             stream_finished=False,
                             token_ids=matched_echo_ids,
                             include_logprobs=False,
+                            include_forced_token_logprobs=True,
+                            logprob_phase="thinking_bos",
+                            logprob_pre_content_token_count=len(matched_echo_ids),
                         )
                         echo_stats = (
                             len(matched_echo_ids),
@@ -822,6 +899,8 @@ async def iter_real_model_stream_infer(
                         generate_think_token_num=generate_think_token_num,
                         _request_shape=request_shape,
                         stream_finished=False,
+                        logprob_phase="thinking",
+                        logprob_pre_content_token_count=len(generated_ids),
                     )
                     if (
                         should_echo
@@ -868,6 +947,8 @@ async def iter_real_model_stream_infer(
                         token_ids=list(runtime.eos_tokens),
                         include_logprobs=False,
                         include_forced_token_logprobs=True,
+                        logprob_phase="thinking_close",
+                        logprob_pre_content_token_count=len(runtime.eos_tokens),
                     )
                     eos_finished = not will_do_phase2
                     eos_finish_reason = (
@@ -920,6 +1001,9 @@ async def iter_real_model_stream_infer(
                     stream_finished=False,
                     token_ids=matched_echo_ids,
                     include_logprobs=False,
+                    include_forced_token_logprobs=True,
+                    logprob_phase="thinking_bos",
+                    logprob_pre_content_token_count=len(matched_echo_ids),
                 )
                 echo_stats = (
                     len(matched_echo_ids),
@@ -934,6 +1018,24 @@ async def iter_real_model_stream_infer(
                 )
                 echoed = True
                 echo_was_split = True
+            logprob_phase = "content"
+            logprob_pre_content_token_count = 0
+            if bool(getattr(generate_config, "in_think_mode", False)):
+                if close_offset is not None:
+                    _, post_close_start, post_close_ids = _split_on_first_close(
+                        generated_ids,
+                        think_close_token_id,
+                        runtime.eos_tokens,
+                    )
+                    logprob_pre_content_token_count = post_close_start
+                    logprob_phase = (
+                        "thinking_content_boundary"
+                        if post_close_ids
+                        else "thinking_close"
+                    )
+                elif generate_think_token_num is None:
+                    logprob_phase = "thinking"
+                    logprob_pre_content_token_count = len(generated_ids)
             response = build_stream_response_from_generate_outputs(
                 dash_sc_request_id=request.id,
                 model_name=request.model_name,
@@ -949,6 +1051,8 @@ async def iter_real_model_stream_infer(
                 generate_think_token_num=generate_think_token_num,
                 finish_reason_override=finish_reason_override,
                 _request_shape=request_shape,
+                logprob_phase=logprob_phase,
+                logprob_pre_content_token_count=logprob_pre_content_token_count,
             )
             if (
                 should_echo
@@ -1116,6 +1220,8 @@ async def iter_real_model_stream_infer(
                     generate_think_token_num=generate_think_token_num,
                     finish_reason_override=finish_reason_override,
                     _request_shape=request_shape,
+                    logprob_phase="content_phase2",
+                    logprob_pre_content_token_count=0,
                 )
                 stats = (
                     len(resp_ids),
@@ -1580,6 +1686,12 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             finish_reason=finish_reason,
                             prompt_token_num=prompt_token_num,
                             prompt_cached_token_num=prompt_cached_token_num,
+                        )
+                        _log_dashsc_grpc_egress_logprobs(
+                            resp,
+                            request_log_tag=f"request_id={request.id}",
+                            enabled=bool(sampling.return_logprobs),
+                            finished=bool(finished),
                         )
                         yield resp
                     return
