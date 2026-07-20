@@ -1527,6 +1527,59 @@ def _append_tensor_output(
     infer.raw_output_contents.append(raw)
 
 
+def _trim_one_elided_trailing_logprob_row(out_py: Any, num_tokens: int) -> None:
+    """Align compact rows after the engine elides one trailing output token.
+
+    A final async/MTP frame can retain placement metadata and probability
+    tensors for the sampled stop/capped token after that token has already
+    been removed from ``output_ids``.  Only this exact one-token trailing skew
+    is recoverable: keep the rows for surviving ids and discard the final row.
+    All other placement mismatches remain hard errors in the caller.
+    """
+    raw_offset = getattr(out_py, "logprobs_offset", None)
+    raw_count = getattr(out_py, "logprobs_count", None)
+    if raw_offset is None or raw_count is None:
+        return
+
+    logprobs_offset = int(raw_offset)
+    logprobs_count = int(raw_count)
+    if logprobs_offset < 0 or logprobs_count < 0:
+        return
+    if logprobs_offset + logprobs_count != num_tokens + 1:
+        return
+
+    trimmed_offset = min(logprobs_offset, num_tokens)
+    trimmed_count = num_tokens - trimmed_offset
+    for name in ("token_logprobs", "top_logprob_token_ids", "top_logprobs"):
+        value = getattr(out_py, name, None)
+        if value is None:
+            continue
+        if value.dim() >= 1 and value.shape[0] == logprobs_count:
+            trimmed = value.narrow(0, 0, trimmed_count)
+        elif (
+            value.dim() >= 2
+            and value.shape[0] == 1
+            and value.shape[1] == logprobs_count
+        ):
+            trimmed = value.narrow(1, 0, trimmed_count)
+        else:
+            raise ValueError(
+                f"{name} does not align with {logprobs_count} compact rows: "
+                f"shape={tuple(value.shape)}"
+            )
+        setattr(out_py, name, trimmed.clone())
+
+    out_py.logprobs_offset = trimmed_offset
+    out_py.logprobs_count = trimmed_count
+    logging.getLogger().debug(
+        "trimmed one elided trailing compact logprob row: "
+        "offset=%s count=%s tokens=%s",
+        logprobs_offset,
+        logprobs_count,
+        num_tokens,
+    )
+
+
 def _append_logprob_outputs(
     infer: predict_v2_pb2.ModelInferResponse,
     out_py: Any,
@@ -1558,6 +1611,11 @@ def _append_logprob_outputs(
 
     if not requested:
         return
+
+    _trim_one_elided_trailing_logprob_row(out_py, num_tokens)
+    token_logprobs = getattr(out_py, "token_logprobs", None)
+    top_token_ids = getattr(out_py, "top_logprob_token_ids", None)
+    top_logprobs = getattr(out_py, "top_logprobs", None)
 
     raw_offset = getattr(out_py, "logprobs_offset", None)
     raw_count = getattr(out_py, "logprobs_count", None)

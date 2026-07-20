@@ -1310,54 +1310,102 @@ class BuildStreamResponseFromGenerateOutputsTest(TestCase):
         as 0/1, 1/2, 2/3, 3/4, 4/5 and 5/6 shape mismatches.
         """
         for accepted in range(6):
-            with self.subTest(accepted=accepted):
-                generated_ids = list(range(100, 100 + accepted))
-                probability_rows = accepted + 1
-                token_logprobs = torch.arange(
-                    probability_rows, dtype=torch.float32
-                ).neg()
-                top_ids = torch.arange(
-                    100,
-                    100 + probability_rows * 5,
-                    dtype=torch.int32,
-                ).reshape(probability_rows, 5)
-                if accepted:
-                    top_ids[:accepted, 0] = torch.tensor(
-                        generated_ids, dtype=torch.int32
+            for compact in (False, True):
+                with self.subTest(accepted=accepted, compact=compact):
+                    self._assert_mtp_uncommitted_tail_is_dropped(
+                        accepted=accepted, compact=compact
                     )
-                top_values = (
-                    torch.arange(probability_rows * 5, dtype=torch.float32)
-                    .neg()
-                    .reshape(probability_rows, 5)
-                )
-                out = GenerateOutput(
-                    output_ids=torch.tensor(generated_ids, dtype=torch.int32),
-                    token_logprobs=token_logprobs,
-                    top_logprob_token_ids=top_ids,
-                    top_logprobs=top_values,
-                    finished=accepted == 0,
-                )
 
-                infer = build_stream_response_from_generate_outputs(
-                    dash_sc_request_id=f"mtp-accept-{accepted}",
-                    model_name="m",
-                    go=GenerateOutputs(generate_outputs=[out]),
-                    request_log_tag="tag",
-                    generate_config=GenerateConfig(
-                        return_logprobs=True, top_logprobs=5
-                    ),
-                ).infer_response
-                metadata = {item.name: item for item in infer.outputs}
-                self.assertEqual(list(metadata["token_logprobs"].shape), [1, accepted])
-                self.assertEqual(
-                    list(metadata["top_logprob_token_ids"].shape),
-                    [1, accepted, 5],
-                )
-                records = json.loads(infer.parameters["logprobs"].string_param)
-                self.assertEqual(len(records), accepted)
-                for token_id, record in zip(generated_ids, records):
-                    self.assertTrue(all(isinstance(key, str) for key in record))
-                    self.assertIn(str(token_id), record)
+    def _assert_mtp_uncommitted_tail_is_dropped(
+        self, *, accepted: int, compact: bool
+    ) -> None:
+        generated_ids = list(range(100, 100 + accepted))
+        probability_rows = accepted + 1
+        token_logprobs = torch.arange(probability_rows, dtype=torch.float32).neg()
+        top_ids = torch.arange(
+            100,
+            100 + probability_rows * 5,
+            dtype=torch.int32,
+        ).reshape(probability_rows, 5)
+        if accepted:
+            top_ids[:accepted, 0] = torch.tensor(generated_ids, dtype=torch.int32)
+        top_values = (
+            torch.arange(probability_rows * 5, dtype=torch.float32)
+            .neg()
+            .reshape(probability_rows, 5)
+        )
+        out = GenerateOutput(
+            output_ids=torch.tensor(generated_ids, dtype=torch.int32),
+            token_logprobs=token_logprobs,
+            top_logprob_token_ids=top_ids,
+            top_logprobs=top_values,
+            finished=accepted == 0,
+            logprobs_offset=0 if compact else None,
+            logprobs_count=probability_rows if compact else None,
+        )
+
+        infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id=f"mtp-accept-{accepted}",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[out]),
+            request_log_tag="tag",
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=5),
+        ).infer_response
+        metadata = {item.name: item for item in infer.outputs}
+        self.assertEqual(list(metadata["token_logprobs"].shape), [1, accepted])
+        self.assertEqual(
+            list(metadata["top_logprob_token_ids"].shape),
+            [1, accepted, 5],
+        )
+        records = json.loads(infer.parameters["logprobs"].string_param)
+        self.assertEqual(len(records), accepted)
+        for token_id, record in zip(generated_ids, records):
+            self.assertTrue(all(isinstance(key, str) for key in record))
+            self.assertIn(str(token_id), record)
+
+    def test_compact_mtp_tail_after_reasoning_prefix_is_dropped(self) -> None:
+        out = GenerateOutput(
+            output_ids=torch.tensor([10, 11], dtype=torch.int32),
+            token_logprobs=torch.tensor([-0.2, -0.3], dtype=torch.float32),
+            top_logprob_token_ids=torch.tensor([[11], [12]], dtype=torch.int32),
+            top_logprobs=torch.tensor([[-0.2], [-0.3]], dtype=torch.float32),
+            logprobs_offset=1,
+            logprobs_count=2,
+        )
+
+        infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id="compact-prefix-tail",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[out]),
+            request_log_tag="tag",
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=1),
+        ).infer_response
+
+        records = json.loads(infer.parameters["logprobs"].string_param)
+        self.assertEqual(records[0], {"10": 0.0})
+        self.assertAlmostEqual(records[1]["11"], -0.2, places=6)
+        self.assertEqual(out.logprobs_offset, 1)
+        self.assertEqual(out.logprobs_count, 1)
+
+    def test_compact_thinking_offset_drops_one_elided_tail(self) -> None:
+        out = GenerateOutput(
+            output_ids=torch.tensor([10, 11], dtype=torch.int32),
+            logprobs_offset=3,
+            logprobs_count=0,
+        )
+
+        infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id="compact-thinking-tail",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[out]),
+            request_log_tag="tag",
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=0),
+        ).infer_response
+
+        records = json.loads(infer.parameters["logprobs"].string_param)
+        self.assertEqual(records, [{"10": 0.0}, {"11": 0.0}])
+        self.assertEqual(out.logprobs_offset, 2)
+        self.assertEqual(out.logprobs_count, 0)
 
     def test_logprob_shape_mismatch_other_than_one_mtp_tail_is_rejected(self) -> None:
         out = GenerateOutput(

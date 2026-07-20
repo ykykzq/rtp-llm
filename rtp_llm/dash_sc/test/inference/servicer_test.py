@@ -2023,6 +2023,48 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(_unpack_int32_le(by_name["generated_ids"]), [142])
 
+    async def test_non_thinking_compact_mtp_tail_is_trimmed_end_to_end(self) -> None:
+        """Regression for the production offset=0,count=1,tokens=0 abort."""
+        out = GenerateOutput(
+            output_ids=torch.tensor([], dtype=torch.int32),
+            token_logprobs=torch.tensor([-0.1], dtype=torch.float32),
+            top_logprob_token_ids=torch.tensor(
+                [[100, 101, 102, 103, 104]], dtype=torch.int32
+            ),
+            top_logprobs=torch.tensor(
+                [[-0.1, -1.1, -2.1, -3.1, -4.1]], dtype=torch.float32
+            ),
+            logprobs_offset=0,
+            logprobs_count=1,
+            finished=True,
+            aux_info=AuxInfo(input_len=1, reuse_len=0),
+        )
+        visitor = _FakeVisitor(
+            _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
+        )
+        servicer = DashScInferenceServicer(backend_visitor=visitor)
+        req = self._valid_infer_request()
+        req.parameters["max_new_tokens"].int64_param = 10
+        req.parameters["top_k"].int64_param = 5
+        req.parameters["logprobs"].bool_param = True
+        req.parameters["top_logprobs"].int64_param = 5
+        req.parameters["enable_thinking"].bool_param = False
+        req.parameters["thinking_budget"].int64_param = 10
+
+        responses = await _drain(
+            servicer.ModelStreamInfer(_areq_iter([req]), _FakeGrpcContext())
+        )
+
+        self.assertEqual(visitor.enqueue_called, 1)
+        self.assertEqual(len(responses), 1)
+        self.assertFalse(responses[0].error_message)
+        self.assertEqual(_gen_ids(responses[0]), [])
+        self.assertEqual(_fp32_output(responses[0], "token_logprobs"), [])
+        config = visitor.last_generate_input.generate_config
+        self.assertTrue(config.return_logprobs)
+        self.assertEqual(config.top_logprobs, 5)
+        self.assertFalse(config.in_think_mode)
+
     async def test_access_log_records_input_and_generated_ids(self) -> None:
         # Frontend struct path: the emitted access line carries the real token
         # ids, proving they travel servicer -> capture -> emit end to end.
