@@ -2196,6 +2196,39 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(generate_config.in_think_mode)
         self.assertEqual(generate_config.max_thinking_tokens, 0)
 
+    async def test_dash_generation_debug_returns_terminal_debug_info(self) -> None:
+        out = GenerateOutput(
+            output_ids=torch.tensor([9], dtype=torch.int32),
+            finished=True,
+            aux_info=AuxInfo(input_len=1, reuse_len=0),
+        )
+        visitor = _FakeVisitor(
+            _FakeAsyncStream([GenerateOutputs(generate_outputs=[out])])
+        )
+        tok = _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            tokenizer=tok,
+            generate_env_config=env_cfg,
+            think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+        )
+        req = self._valid_infer_request()
+        req.parameters["debug"].bool_param = True
+        req.parameters["max_new_tokens"].int64_param = 3
+
+        responses = await _drain(
+            servicer.ModelStreamInfer(_areq_iter([req]), MagicMock())
+        )
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(
+            json.loads(
+                responses[0].infer_response.parameters["debug_info"].string_param
+            ),
+            {"llm_params": {"max_new_tokens": 3, "max_new_think_tokens": 0}},
+        )
+
     async def test_dash_generation_enable_thinking_true_without_budget_keeps_thinking(
         self,
     ) -> None:

@@ -1059,6 +1059,21 @@ class DashScGrpcRequestTest(TestCase):
         op = parse_other_params(req)
         self.assertEqual(op.reasoning_effort, "xhigh")
 
+    def test_parse_other_params_debug_parameter(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        req.parameters["debug"].bool_param = True
+        self.assertTrue(parse_other_params(req).debug)
+
+        req = predict_v2_pb2.ModelInferRequest()
+        req.parameters["debug"].bool_param = False
+        self.assertFalse(parse_other_params(req).debug)
+
+        req = predict_v2_pb2.ModelInferRequest()
+        req.parameters["ds_header_attributes"].string_param = json.dumps(
+            {"parameters": {"debug": True}}
+        )
+        self.assertTrue(parse_other_params(req).debug)
+
     def test_parse_other_params_dashscope_body_thinking_aliases(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
         req.parameters["enable_thinking"].bool_param = False
@@ -1434,6 +1449,42 @@ class BuildStreamResponseFromGenerateOutputsTest(TestCase):
         self.assertNotIn("top_logprob_token_ids", names)
         self.assertNotIn("top_logprobs", names)
         self.assertNotIn("logprobs", infer.parameters)
+
+    def test_stream_response_returns_dash_debug_info_when_requested(self) -> None:
+        config = GenerateConfig(max_new_tokens=128, max_thinking_tokens=100)
+        unfinished = GenerateOutput(
+            output_ids=torch.tensor([7], dtype=torch.int32), finished=False
+        )
+        unfinished_infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id="debug-streaming",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[unfinished]),
+            request_log_tag="tag",
+            generate_config=config,
+            debug=True,
+        ).infer_response
+        self.assertNotIn("debug_info", unfinished_infer.parameters)
+
+        finished = GenerateOutput(
+            output_ids=torch.tensor([8], dtype=torch.int32), finished=True
+        )
+        finished_infer = build_stream_response_from_generate_outputs(
+            dash_sc_request_id="debug-finished",
+            model_name="m",
+            go=GenerateOutputs(generate_outputs=[finished]),
+            request_log_tag="tag",
+            generate_config=config,
+            debug=True,
+        ).infer_response
+        self.assertEqual(
+            json.loads(finished_infer.parameters["debug_info"].string_param),
+            {
+                "llm_params": {
+                    "max_new_tokens": 128,
+                    "max_new_think_tokens": 100,
+                }
+            },
+        )
 
     def test_error_response_uses_business_status_frame(self) -> None:
         resp = build_error_response(

@@ -721,6 +721,7 @@ class OtherParams:
     timeout_ms: int | None = None
     traffic_reject_priority: int | None = None
     reasoning_effort: str | None = None
+    debug: bool = False
     request_headers: dict[str, str] = field(default_factory=dict)
 
 
@@ -1032,6 +1033,10 @@ def parse_other_params(request, ds_attrs: dict[str, Any] | None = None) -> Other
             _lookup_ds_request_control(ds_attrs, "reasoning_effort")
         )
 
+    debug = _parse_optional_parameter_bool(request, "debug")
+    if debug is None:
+        debug = _parse_optional_bool(_lookup_ds_request_control(ds_attrs, "debug"))
+
     timeout_s = _parse_optional_int_value(ds_attrs.get("x-dashscope-inner-timeout"))
     timeout_ms = timeout_s * 1000 if timeout_s is not None and timeout_s > 0 else None
 
@@ -1056,6 +1061,7 @@ def parse_other_params(request, ds_attrs: dict[str, Any] | None = None) -> Other
         timeout_ms=timeout_ms,
         traffic_reject_priority=traffic_reject_priority,
         reasoning_effort=reasoning_effort,
+        debug=bool(debug),
         request_headers=request_headers,
     )
 
@@ -1211,6 +1217,7 @@ def _append_dashllm_limit_parameters(
     eos_token_id: int | None = None,
     max_token_id: int | None = None,
     generate_think_token_num: int | None = None,
+    debug: bool = False,
 ) -> None:
     """Mirror dashllm response parameters consumed by dashscope-serving."""
     if generate_config is not None:
@@ -1229,6 +1236,18 @@ def _append_dashllm_limit_parameters(
     if generate_think_token_num is not None:
         infer.parameters["generate_think_token_num"].int64_param = int(
             generate_think_token_num
+        )
+    if debug:
+        llm_params: dict[str, int] = {}
+        if generate_config is not None:
+            llm_params["max_new_tokens"] = int(
+                getattr(generate_config, "max_new_tokens", 0) or 0
+            )
+            llm_params["max_new_think_tokens"] = int(
+                getattr(generate_config, "max_thinking_tokens", 0) or 0
+            )
+        infer.parameters["debug_info"].string_param = json.dumps(
+            {"llm_params": llm_params}, separators=(",", ":")
         )
 
 
@@ -1620,6 +1639,7 @@ def build_stream_response_from_generate_outputs(
     token_ids: list[int] | None = None,
     include_logprobs: bool = True,
     include_forced_token_logprobs: bool = False,
+    debug: bool = False,
 ) -> predict_v2_pb2.ModelStreamInferResponse:
     """Build ``ModelStreamInferResponse`` from one ``GenerateOutputs`` chunk.
 
@@ -1699,6 +1719,7 @@ def build_stream_response_from_generate_outputs(
         eos_token_id=eos_token_id,
         max_token_id=max_token_id,
         generate_think_token_num=generate_think_token_num,
+        debug=debug and finished,
     )
 
     logging.debug("[DashScGrpc] [%s] generated_ids: %s", request_log_tag, generated_ids)
