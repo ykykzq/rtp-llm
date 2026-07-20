@@ -17,6 +17,9 @@
 namespace rtp_llm {
 
 class CPSlotMapper;
+class BlockTreeCache;
+class KVCacheGroup;
+using KVCacheGroupPtr = std::shared_ptr<KVCacheGroup>;
 struct KVCacheTokenCapacity {
     size_t total_tokens     = 0;
     size_t available_tokens = 0;
@@ -77,6 +80,7 @@ public:
                                                           int                            reserve_step) const                       = 0;
 
     MallocResult malloc(const MallocInfo& malloc_info);
+    bool         cancelLoadBack(const std::shared_ptr<AsyncContext>& context);
     virtual void blockCopy(int src_block_index, int dest_block_index);
     virtual void blockBatchCopy(const std::vector<BlockIdPair>& copy_mapping);
     virtual void blockBatchCopy(const BlockIdPair* copy_mapping_begin, const BlockIdPair* copy_mapping_end);
@@ -89,6 +93,16 @@ public:
 
     SharedBlockCachePtr sharedBlockCache() const {
         return shared_block_cache_;
+    }
+
+    virtual std::vector<KVCacheGroupPtr> cacheGroups() const {
+        return {};
+    }
+
+    void setBlockTreeCache(BlockTreeCache* block_tree_cache);
+
+    BlockTreeCache* blockTreeCache() const {
+        return block_tree_cache_;
     }
 
     void setSharedBlockCache(SharedBlockCachePtr shared_block_cache) {
@@ -154,6 +168,7 @@ protected:
     AllocationType                     allocation_type_;
     BlockPoolPtr                       block_pool_;
     SharedBlockCachePtr                shared_block_cache_;
+    BlockTreeCache*                    block_tree_cache_ = nullptr;
     std::shared_ptr<CPSlotMapper>      cp_slot_mapper_;
     const kmonitor::MetricsReporterPtr metrics_reporter_           = nullptr;
     bool                               use_cuda_malloc_block_pool_ = false;
