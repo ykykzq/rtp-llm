@@ -74,13 +74,14 @@ void FIFOScheduler::onRunningStream(const GenerateStreamPtr& stream) {
 
 bool FIFOScheduler::waitPredicate() {
     // Check streams directly without calling empty() which acquires lock_ (already held by schedule())
-    return stop_ || schedule_trigger_ || !waiting_streams_.empty() || !loading_cache_streams_.empty()
-           || !running_streams_.empty();
+    // A pending load is polled by the timed wait below; it is not itself a
+    // wakeup event, otherwise the predicate is immediately true and spins a CPU.
+    return stop_ || schedule_trigger_ || !waiting_streams_.empty() || !running_streams_.empty();
 }
 
 absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     unique_lock<mutex> lock(lock_);
-    if (need_fill_fake_stream_) {
+    if (need_fill_fake_stream_ || !loading_cache_streams_.empty()) {
         cond_.wait_for(lock, std::chrono::milliseconds(10), [this] { return waitPredicate(); });
     } else {
         cond_.wait(lock, [this] { return waitPredicate(); });
