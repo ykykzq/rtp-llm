@@ -63,9 +63,13 @@ void addBatchError(EnqueueBatchResponsePB* response, int64_t request_id, int64_t
 PrefillBatchRpcServer::~PrefillBatchRpcServer() {
     stopAsyncResponseWorkers();
     stopResponseRegistryGc();
-    if (slot_worker_pool_) {
-        slot_worker_pool_->stop();
-        slot_worker_pool_.reset();
+    if (prepare_resource_worker_pool_) {
+        prepare_resource_worker_pool_->stop();
+        prepare_resource_worker_pool_.reset();
+    }
+    if (worker_run_pool_) {
+        worker_run_pool_->stop();
+        worker_run_pool_.reset();
     }
 }
 
@@ -163,25 +167,45 @@ void PrefillBatchRpcServer::stopAsyncResponseWorkers() {
 }
 
 void PrefillBatchRpcServer::initThreadPools() {
-    const auto& pd_sep_config     = maga_init_params_.pd_sep_config;
-    const int   concurrency_limit = std::max(1, maga_init_params_.concurrency_config.concurrency_limit);
+    const auto&   pd_sep_config     = maga_init_params_.pd_sep_config;
+    const int64_t concurrency_limit = std::max<int64_t>(1, maga_init_params_.concurrency_config.concurrency_limit);
+    const int64_t configured_prepare_size       = pd_sep_config.prefill_prepare_resource_pool_size > 0 ?
+                                                      pd_sep_config.prefill_prepare_resource_pool_size :
+                                                      concurrency_limit * 2;
+    const int64_t prepare_resource_threads      = std::max<int64_t>(128, configured_prepare_size);
+    const int64_t prepare_resource_queue        = prepare_resource_threads;
+    const size_t  prepare_resource_thread_count = static_cast<size_t>(prepare_resource_threads);
+    const size_t  prepare_resource_queue_size   = static_cast<size_t>(prepare_resource_queue);
 
-    // Slot pool: Prepare + per-stream async response runners.
-    // Configurable via pd_sep_config.prefill_slot_pool_size (0 = use formula default)
-    const int slot_threads = pd_sep_config.prefill_slot_pool_size > 0 ?
-                                 static_cast<int>(pd_sep_config.prefill_slot_pool_size) :
-                                 std::max(16, concurrency_limit * 8);
-    const int slot_queue   = slot_threads * 8;
-
-    slot_worker_pool_ =
-        std::make_shared<autil::LockFreeThreadPool>(slot_threads, slot_queue, nullptr, "PrefillSlotPool");
-    RTP_LLM_CHECK_WITH_INFO(slot_worker_pool_->start(), "PrefillRpcServer slot thread pool start failed");
-    RTP_LLM_LOG_INFO("PrefillRpcServer slot pool started: threads=%d queue=%d (concurrency_limit=%d)",
-                     slot_threads,
-                     slot_queue,
+    prepare_resource_worker_pool_ = std::make_shared<autil::LockFreeThreadPool>(
+        prepare_resource_thread_count, prepare_resource_queue_size, nullptr, "PrefillPrepareResource");
+    RTP_LLM_CHECK_WITH_INFO(prepare_resource_worker_pool_->start(),
+                            "PrefillRpcServer prepare-resource thread pool start failed");
+    RTP_LLM_LOG_INFO("PrefillRpcServer prepare-resource pool started: threads=%ld queue=%ld "
+                     "(configured=%ld concurrency_limit=%ld)",
+                     prepare_resource_threads,
+                     prepare_resource_queue,
+                     pd_sep_config.prefill_prepare_resource_pool_size,
                      concurrency_limit);
-    slot_pool_metrics_.thread_max = static_cast<size_t>(slot_threads);
-    slot_pool_metrics_.queue_max  = static_cast<size_t>(slot_queue);
+    prepare_resource_pool_metrics_.thread_max = prepare_resource_thread_count;
+    prepare_resource_pool_metrics_.queue_max  = prepare_resource_queue_size;
+
+    constexpr int64_t default_worker_run_threads    = 1024;
+    const int64_t     configured_worker_run_threads = pd_sep_config.prefill_worker_run_pool_size > 0 ?
+                                                          pd_sep_config.prefill_worker_run_pool_size :
+                                                          default_worker_run_threads;
+    const int64_t     worker_run_threads            = std::max<int64_t>(1, configured_worker_run_threads);
+    const size_t      worker_run_thread_count       = static_cast<size_t>(worker_run_threads);
+    constexpr size_t  worker_run_queue_size         = autil::ThreadPoolBase::DEFAULT_QUEUESIZE;
+    worker_run_pool_                                = std::make_shared<autil::LockFreeThreadPool>(
+        worker_run_thread_count, worker_run_queue_size, nullptr, "PrefillWorkerRun");
+    RTP_LLM_CHECK_WITH_INFO(worker_run_pool_->start(), "PrefillRpcServer worker-run thread pool start failed");
+    RTP_LLM_LOG_INFO("PrefillRpcServer worker-run pool started: threads=%ld queue=%zu (configured=%ld)",
+                     worker_run_threads,
+                     worker_run_queue_size,
+                     pd_sep_config.prefill_worker_run_pool_size);
+    worker_run_pool_metrics_.thread_max = worker_run_thread_count;
+    worker_run_pool_metrics_.queue_max  = worker_run_queue_size;
 }
 
 void PrefillBatchRpcServer::reportPoolMetrics() {
@@ -191,18 +215,28 @@ void PrefillBatchRpcServer::reportPoolMetrics() {
         response_worker_count = response_worker_count_;
     }
     // Report to kmonitor (called every 10s from GC thread)
-    reportPoolMetricsToKmonitor(metrics_reporter_, "slot", slot_pool_metrics_);
+    reportPoolMetricsToKmonitor(metrics_reporter_, "prepare_resource", prepare_resource_pool_metrics_);
+    reportPoolMetricsToKmonitor(metrics_reporter_, "worker_run", worker_run_pool_metrics_);
+    RTP_LLM_LOG_DEBUG("PoolMetrics prepare_resource: active=%zu queued=%zu completed=%zu rejected=%zu fallback=%zu "
+                      "thread_max=%zu queue_max=%zu",
+                      prepare_resource_pool_metrics_.active.load(),
+                      prepare_resource_pool_metrics_.queued.load(),
+                      prepare_resource_pool_metrics_.completed.load(),
+                      prepare_resource_pool_metrics_.rejected.load(),
+                      prepare_resource_pool_metrics_.fallback.load(),
+                      prepare_resource_pool_metrics_.thread_max,
+                      prepare_resource_pool_metrics_.queue_max);
     RTP_LLM_LOG_DEBUG(
-        "PoolMetrics slot: active=%zu queued=%zu completed=%zu rejected=%zu fallback=%zu response_workers=%zu "
+        "PoolMetrics worker_run: active=%zu queued=%zu completed=%zu rejected=%zu fallback=%zu response_workers=%zu "
         "thread_max=%zu queue_max=%zu",
-        slot_pool_metrics_.active.load(),
-        slot_pool_metrics_.queued.load(),
-        slot_pool_metrics_.completed.load(),
-        slot_pool_metrics_.rejected.load(),
-        slot_pool_metrics_.fallback.load(),
+        worker_run_pool_metrics_.active.load(),
+        worker_run_pool_metrics_.queued.load(),
+        worker_run_pool_metrics_.completed.load(),
+        worker_run_pool_metrics_.rejected.load(),
+        worker_run_pool_metrics_.fallback.load(),
         response_worker_count,
-        slot_pool_metrics_.thread_max,
-        slot_pool_metrics_.queue_max);
+        worker_run_pool_metrics_.thread_max,
+        worker_run_pool_metrics_.queue_max);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,58 +471,59 @@ std::vector<PrefillBatchRpcServer::PrepareResult> PrefillBatchRpcServer::prepare
     for (size_t i = 0; i < slots.size(); ++i) {
         auto* slot   = &slots[i];
         auto* result = &results[i];
-        slot_pool_metrics_.queued++;
+        prepare_resource_pool_metrics_.queued++;
         try {
-            auto future = slot_worker_pool_->async([this, slot, result, max_retry_times, max_retry_timeout_ms] {
-                try {
-                    slot_pool_metrics_.queued--;
-                    slot_pool_metrics_.active++;
-                    ScopeExit slot_prepare_guard([this] {
-                        slot_pool_metrics_.active--;
-                        slot_pool_metrics_.completed++;
-                    });
-                    int64_t   begin_time_us = currentTimeUs();
-                    auto      stage         = slot->prefill_context->stat_info.saveStage();
-                    for (int attempt = 0; attempt <= max_retry_times; ++attempt) {
-                        slot->prefill_context->reset();
-                        slot->prefill_context->stat_info.restoreStage(stage);
-                        slot->prefill_context->retry_times++;
-                        prepareAllocateResource(*slot->prefill_context);
-                        if (slot->prefill_context->ok()) {
-                            result->prepared = true;
-                            return;
+            auto future =
+                prepare_resource_worker_pool_->async([this, slot, result, max_retry_times, max_retry_timeout_ms] {
+                    try {
+                        prepare_resource_pool_metrics_.queued--;
+                        prepare_resource_pool_metrics_.active++;
+                        ScopeExit slot_prepare_guard([this] {
+                            prepare_resource_pool_metrics_.active--;
+                            prepare_resource_pool_metrics_.completed++;
+                        });
+                        int64_t   begin_time_us = currentTimeUs();
+                        auto      stage         = slot->prefill_context->stat_info.saveStage();
+                        for (int attempt = 0; attempt <= max_retry_times; ++attempt) {
+                            slot->prefill_context->reset();
+                            slot->prefill_context->stat_info.restoreStage(stage);
+                            slot->prefill_context->retry_times++;
+                            prepareAllocateResource(*slot->prefill_context);
+                            if (slot->prefill_context->ok()) {
+                                result->prepared = true;
+                                return;
+                            }
+                            auto cost_time_us                         = currentTimeUs() - begin_time_us;
+                            slot->prefill_context->retry_cost_time_ms = cost_time_us / 1000;
+                            if (max_retry_timeout_ms > 0 && cost_time_us >= max_retry_timeout_ms * 1000) {
+                                break;
+                            }
+                            usleep(1000);
                         }
-                        auto cost_time_us                         = currentTimeUs() - begin_time_us;
-                        slot->prefill_context->retry_cost_time_ms = cost_time_us / 1000;
-                        if (max_retry_timeout_ms > 0 && cost_time_us >= max_retry_timeout_ms * 1000) {
-                            break;
+                        result->stage_status = slot->prefill_context->error_status.ok() ?
+                                                   statusFromErrorInfo(slot->prefill_context->error_info) :
+                                                   slot->prefill_context->error_status;
+                        if (result->stage_status.ok()) {
+                            result->stage_status =
+                                grpc::Status(grpc::StatusCode::INTERNAL, "prepareAllocateResource failed");
                         }
-                        usleep(1000);
-                    }
-                    result->stage_status = slot->prefill_context->error_status.ok() ?
-                                               statusFromErrorInfo(slot->prefill_context->error_info) :
-                                               slot->prefill_context->error_status;
-                    if (result->stage_status.ok()) {
+                    } catch (const std::exception& e) {
+                        result->stage_status = grpc::Status(
+                            grpc::StatusCode::INTERNAL, "prepareAllocateResource exception: " + std::string(e.what()));
+                    } catch (...) {
                         result->stage_status =
-                            grpc::Status(grpc::StatusCode::INTERNAL, "prepareAllocateResource failed");
+                            grpc::Status(grpc::StatusCode::INTERNAL, "prepareAllocateResource unknown exception");
                     }
-                } catch (const std::exception& e) {
-                    result->stage_status = grpc::Status(grpc::StatusCode::INTERNAL,
-                                                        "prepareAllocateResource exception: " + std::string(e.what()));
-                } catch (...) {
-                    result->stage_status =
-                        grpc::Status(grpc::StatusCode::INTERNAL, "prepareAllocateResource unknown exception");
-                }
-            });
+                });
             prepare_futures.emplace_back(std::move(future));
         } catch (const std::exception& e) {
-            slot_pool_metrics_.queued--;
-            slot_pool_metrics_.rejected++;
+            prepare_resource_pool_metrics_.queued--;
+            prepare_resource_pool_metrics_.rejected++;
             result->stage_status =
                 grpc::Status(grpc::StatusCode::INTERNAL, "submit prepare task exception: " + std::string(e.what()));
         } catch (...) {
-            slot_pool_metrics_.queued--;
-            slot_pool_metrics_.rejected++;
+            prepare_resource_pool_metrics_.queued--;
+            prepare_resource_pool_metrics_.rejected++;
             result->stage_status = grpc::Status(grpc::StatusCode::INTERNAL, "submit prepare task unknown exception");
         }
     }
@@ -554,40 +589,42 @@ grpc::Status PrefillBatchRpcServer::launchSlotRunner(ReadySlot& ready_slot) {
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "EnqueueGroup server is stopping");
     }
 
-    auto cancel_state = std::make_shared<std::atomic<bool>>(false);
+    auto cancel_state = slot.prefill_context->cancel_state;
     entry->installCancelProducer([cancel_state] { cancel_state->store(true); });
-    slot.prefill_context->cancel_state = std::move(cancel_state);
 
-    auto state                                = std::make_shared<SlotRunnerState>();
-    state->prefill_context                    = std::move(slot.prefill_context);
-    state->input                              = slot.input;
-    state->writer                             = std::move(writer);
-    state->entry                              = entry;
-    state->request_guard                      = std::move(slot.request_guard);
-    auto                        request_id    = slot.input->request_id();
+    auto state             = std::make_shared<SlotRunnerState>();
+    state->prefill_context = std::move(slot.prefill_context);
+    state->input           = slot.input;
+    state->writer          = std::move(writer);
+    state->entry           = entry;
+    state->request_guard   = std::move(slot.request_guard);
+    auto request_id        = slot.input->request_id();
+    worker_run_pool_metrics_.queued++;
     autil::ThreadPoolBase::Task stream_runner = [this, state, request_id]() mutable {
+        worker_run_pool_metrics_.queued--;
         runSlotStream(std::move(*state), request_id);
     };
-    // Admission blocks on backpressure: an ACK must imply that both the scheduler stream and its
-    // response runner have been accepted.
-    auto error = slot_worker_pool_->pushTask(std::move(stream_runner), /*isBlocked=*/true);
+    // Never block the EnqueueGroup RPC handler. If the worker pool is saturated, reject the slot;
+    // rejectSlot() tears down both the local stream and the prepared remote decode stream.
+    auto error = worker_run_pool_->pushTask(std::move(stream_runner), /*isBlocked=*/false);
     if (error != autil::ThreadPoolBase::ERROR_NONE) {
-        slot_pool_metrics_.rejected++;
+        worker_run_pool_metrics_.queued--;
+        worker_run_pool_metrics_.rejected++;
         finishAsyncResponseWorker();
         slot.prefill_context                     = std::move(state->prefill_context);
         slot.request_guard                       = std::move(state->request_guard);
         slot.prefill_context->rpc_context.writer = nullptr;
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                            "EnqueueGroup slot pool rejected task with error=" + std::to_string(error));
+                            "EnqueueGroup worker-run pool rejected task with error=" + std::to_string(error));
     }
     return grpc::Status::OK;
 }
 
 void PrefillBatchRpcServer::runSlotStream(SlotRunnerState state, int64_t request_id) {
-    slot_pool_metrics_.active++;
+    worker_run_pool_metrics_.active++;
     ScopeExit    slot_finish_task_guard([this] {
-        slot_pool_metrics_.active--;
-        slot_pool_metrics_.completed++;
+        worker_run_pool_metrics_.active--;
+        worker_run_pool_metrics_.completed++;
     });
     ScopeExit    worker_finish_guard([this] { finishAsyncResponseWorker(); });
     ScopeExit    release_state_guard([&] {
@@ -600,7 +637,7 @@ void PrefillBatchRpcServer::runSlotStream(SlotRunnerState state, int64_t request
     grpc::Status finish_status;
     try {
         finish_status = finishStream(*state.prefill_context);
-        RTP_LLM_LOG_DEBUG("request [%ld] finishStream returned, ok=%d, has_stream=%d",
+        RTP_LLM_LOG_DEBUG("request [%ld] worker run returned, ok=%d, has_stream=%d",
                           request_id,
                           finish_status.ok(),
                           state.prefill_context->getStream() ? 1 : 0);
@@ -633,12 +670,17 @@ void PrefillBatchRpcServer::rejectSlot(ReadySlot&              ready_slot,
                                        EnqueueBatchResponsePB* response) {
     auto&   slot       = *ready_slot.slot;
     int64_t request_id = slot.input->request_id();
-    if (slot.prefill_context && slot.prefill_context->getStream()) {
-        auto stream = slot.prefill_context->getStream();
-        if (!stream->hasError()) {
-            stream->reportError(status.error_code() == grpc::StatusCode::CANCELLED ? ErrorCode::CANCELLED :
-                                                                                     ErrorCode::UNKNOWN_ERROR,
-                                std::string(status.error_message()));
+    if (slot.prefill_context) {
+        // The context destructor owns gRPC teardown. Mark this rejected request as cancelled so
+        // closeGrpcStream() uses TryCancel() before waiting for the remote stream to finish.
+        slot.prefill_context->cancel_state->store(true);
+        if (slot.prefill_context->getStream()) {
+            auto stream = slot.prefill_context->getStream();
+            if (!stream->hasError()) {
+                stream->reportError(status.error_code() == grpc::StatusCode::CANCELLED ? ErrorCode::CANCELLED :
+                                                                                         ErrorCode::UNKNOWN_ERROR,
+                                    std::string(status.error_message()));
+            }
         }
     }
     slot.prefill_context.reset();

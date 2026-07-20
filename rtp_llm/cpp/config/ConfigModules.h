@@ -436,8 +436,10 @@ struct PDSepConfig {
     int64_t  worker_port_offset              = 0;
     bool     decode_entrance                 = false;
     // ========== Prefill Thread Pool Configuration ==========
-    // slot pool size (Prepare + async response runners). 0 = use formula default.
-    int64_t prefill_slot_pool_size = 0;
+    // prepare-resource pool size. 0 = concurrency_limit * 2; effective minimum is 128.
+    int64_t prefill_prepare_resource_pool_size = 0;
+    // worker-run pool size. 0 = use the default of 1024.
+    int64_t prefill_worker_run_pool_size = 1024;
     // Max wait time in stopStream() for Engine Loop to call finish_internal().
     // When GenerateDone is set and stream has no error, stopStream() waits up to
     // this many ms for Engine Loop's advance() to detect GenerateDone and set FINISHED.

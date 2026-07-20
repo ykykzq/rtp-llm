@@ -78,7 +78,7 @@ private:
     // Prepare and enqueue the group synchronously; ACK only streams admitted by the scheduler.
     grpc::Status acceptGroup(std::vector<BatchSlot> slots, EnqueueBatchResponsePB* response);
     void         buildSlotContexts(std::vector<BatchSlot>& slots);
-    // prepareAllocateResource-with-retry per slot on slot_worker_pool_.
+    // prepareAllocateResource-with-retry per slot on prepare_resource_worker_pool_.
     std::vector<PrepareResult> prepareGroup(std::vector<BatchSlot>& slots);
     // engine_->enqueueMultiple for the prepared slots.
     grpc::Status enqueueGroupStreams(std::vector<ReadySlot>& ready_slots);
@@ -109,9 +109,12 @@ private:
     std::condition_variable response_worker_cv_;
     size_t                  response_worker_count_{0};
 
-    // Thread pool replacing std::async / std::thread::detach.
-    autil::ThreadPoolBasePtr slot_worker_pool_;  // Prepare + async response runners.
-    PoolMetrics              slot_pool_metrics_;
+    // Resource preparation is a short prefill-only phase. Worker runs include cache loading and
+    // span the prefill/decode lifecycle, so both pools have independent configurable capacities.
+    autil::ThreadPoolBasePtr prepare_resource_worker_pool_;
+    autil::ThreadPoolBasePtr worker_run_pool_;
+    PoolMetrics              prepare_resource_pool_metrics_;
+    PoolMetrics              worker_run_pool_metrics_;
 };
 
 }  // namespace rtp_llm

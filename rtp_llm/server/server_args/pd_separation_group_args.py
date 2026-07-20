@@ -54,12 +54,21 @@ def init_pd_separation_group_args(parser, pd_separation_config):
     )
 
     pd_separation_group.add_argument(
-        "--prefill_slot_pool_size",
-        env_name="PREFILL_SLOT_POOL_SIZE",
-        bind_to=(pd_separation_config, "prefill_slot_pool_size"),
+        "--prefill_prepare_resource_pool_size",
+        env_name="PREFILL_PREPARE_RESOURCE_POOL_SIZE",
+        bind_to=(pd_separation_config, "prefill_prepare_resource_pool_size"),
         type=int,
         default=0,
-        help="Prefill slot 线程池大小，0 表示使用公式默认值",
+        help="Prefill prepare-resource 线程池大小；0 表示 concurrency_limit * 2，最终值最小为 128；queue 同值",
+    )
+
+    pd_separation_group.add_argument(
+        "--prefill_worker_run_pool_size",
+        env_name="PREFILL_WORKER_RUN_POOL_SIZE",
+        bind_to=(pd_separation_config, "prefill_worker_run_pool_size"),
+        type=int,
+        default=1024,
+        help="Prefill worker-run 线程池大小；0 表示使用默认值 1024；queue 使用线程池默认值 32",
     )
 
     pd_separation_group.add_argument(

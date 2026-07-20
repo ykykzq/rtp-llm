@@ -68,6 +68,7 @@ public:
         GenerateContext(rpc_context.requestID(), timeout_ms, server_context, metrics_reporter, meta),
         resource(resource),
         rpc_context(rpc_context),
+        cancel_state(std::make_shared<std::atomic<bool>>(false)),
         prefill_stop_stream_wait_timeout_ms_(prefill_stop_stream_wait_timeout_ms) {
         prefill_worker_cache_store_addrs = resource->workers;
     }
