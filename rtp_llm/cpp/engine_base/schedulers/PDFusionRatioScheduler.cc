@@ -121,7 +121,7 @@ absl::StatusOr<list<GenerateStreamPtr>> PDFusionRatioScheduler::schedule() {
     if (round == RoundType::PREFILL) {
         const size_t prev_waiting_size = waiting_streams_.size();
         evaluateWaitingStreams(waiting_streams_);
-        made_progress |= evaluateAndUpdateStreams(waiting_streams_) > 0;
+        made_progress |= waiting_streams_.size() < prev_waiting_size;
         if (!new_streams_.empty()) {
             list<GenerateStreamPtr> prefill_batch(new_streams_.begin(), new_streams_.end());
             pending_decode_streams_.insert(pending_decode_streams_.end(), new_streams_.begin(), new_streams_.end());
