@@ -19,6 +19,8 @@ test_deps = [
     "//3rdparty/contextFusedMultiHeadAttention:trt_fmha_impl",
     "//3rdparty/contextFusedMultiHeadAttentionSm70:trt_sm70_fmha_impl",
     "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
+    "//rtp_llm/cpp/cache/connector:connector_base",
+    "//rtp_llm/cpp/cache/test/mock:mock_allocator_lib",
     "//rtp_llm/cpp/normal_engine:normal_engine",
     "//rtp_llm/cpp/engine_base/schedulers:schedulers",
     "//rtp_llm/cpp/test:test_utils",

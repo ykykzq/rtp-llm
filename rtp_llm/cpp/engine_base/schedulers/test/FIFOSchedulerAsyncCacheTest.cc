@@ -414,10 +414,10 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testLoadingCacheStreams_IncludedInEmptyAndOn
 }
 
 // ============================================================================
-// 8. loading_cache_streams_ included in waitPredicate()
+// 8. loading-only work relies on timed polling rather than waitPredicate()
 // ============================================================================
 
-TEST_F(FIFOSchedulerAsyncCacheTest, testWaitPredicate_IncludesLoadingCacheStreams) {
+TEST_F(FIFOSchedulerAsyncCacheTest, testWaitPredicate_LoadingOnlyUsesTimedPolling) {
     auto scheduler = createScheduler();
     // Empty scheduler -> waitPredicate should be false
     ASSERT_FALSE(scheduler->waitPredicate());
@@ -425,7 +425,7 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testWaitPredicate_IncludesLoadingCacheStream
     // Add a fake stream to loading_cache_streams_
     auto stream = createStream({1, 2, 3});
     scheduler->loading_cache_streams_.emplace_back(stream);
-    ASSERT_TRUE(scheduler->waitPredicate());
+    ASSERT_FALSE(scheduler->waitPredicate());
 }
 
 // ============================================================================
@@ -547,6 +547,18 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testScheduleOrdering_LoadDoneStreamsAtWaitin
     ASSERT_TRUE(result2.ok());
     // Both streams should be running now
     ASSERT_GE(result2.value().size(), 1);
+}
+
+TEST_F(FIFOSchedulerAsyncCacheTest, testLoadingOnlyStateUsesTimedPollWithoutImmediatePredicateSpin) {
+    auto scheduler = createScheduler();
+    ASSERT_FALSE(scheduler->waitPredicate());
+
+    auto stream = createStream({1, 2, 3});
+    scheduler->loading_cache_streams_.emplace_back(stream);
+
+    // A pending load is polled by schedule()'s 10 ms timed wait. It must not
+    // make the condition predicate immediately true and spin the scheduler.
+    EXPECT_FALSE(scheduler->waitPredicate());
 }
 
 }  // namespace rtp_llm
