@@ -119,6 +119,11 @@ public:
     std::optional<torch::Tensor> all_hidden_states;
     std::optional<torch::Tensor> logits;
     std::optional<torch::Tensor> loss;
+    // Compact raw-target log probabilities for the output tokens in this response.
+    // Shapes: [output_len], [output_len, K], [output_len, K].
+    std::optional<torch::Tensor> token_logprobs;
+    std::optional<torch::Tensor> top_logprob_token_ids;
+    std::optional<torch::Tensor> top_logprobs;
 };
 
 class GenerateOutputs {

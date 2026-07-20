@@ -36,6 +36,8 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     generate_config->force_sp_accept          = config_proto->force_sp_accept();
     generate_config->return_cum_log_probs     = config_proto->return_cum_log_probs();
     generate_config->return_all_probs         = config_proto->return_all_probs();
+    generate_config->return_logprobs          = config_proto->return_logprobs();
+    generate_config->top_logprobs             = static_cast<int>(config_proto->top_logprobs());
     generate_config->return_softmax_probs     = config_proto->return_softmax_probs();
     generate_config->can_use_pd_separation    = config_proto->can_use_pd_separation();
     generate_config->gen_timeline             = config_proto->gen_timeline();
@@ -354,6 +356,46 @@ void QueryConverter::transResponse(GenerateOutputsPB*     outputs,
 
     stackBuffersToTensorPB(
         flatten_output->mutable_all_hidden_states(), source_outputs, [](const auto& r) { return r.all_hidden_states; });
+
+    // Logprob outputs are optional and absent for the common disabled path.
+    // Collect all three fields in one pass, then create a protobuf submessage
+    // only for a field that has a defined tensor in every batch item.
+    std::vector<torch::Tensor> token_logprobs;
+    std::vector<torch::Tensor> top_logprob_token_ids;
+    std::vector<torch::Tensor> top_logprobs;
+
+    auto append_optional_tensor = [&](std::vector<torch::Tensor>&         tensors,
+                                      const std::optional<torch::Tensor>& tensor_opt) {
+        if (tensor_opt.has_value() && tensor_opt->defined()) {
+            if (tensors.empty()) {
+                tensors.reserve(source_outputs.size());
+            }
+            tensors.push_back(tensor_opt->contiguous());
+        }
+    };
+    for (const auto& response : source_outputs) {
+        append_optional_tensor(token_logprobs, response.token_logprobs);
+        append_optional_tensor(top_logprob_token_ids, response.top_logprob_token_ids);
+        append_optional_tensor(top_logprobs, response.top_logprobs);
+    }
+
+    auto serialize_optional_tensors =
+        [&](const std::vector<torch::Tensor>& tensors, auto mutable_tensor_pb, const char* field_name) {
+            if (tensors.empty()) {
+                return;
+            }
+            RTP_LLM_CHECK_WITH_INFO(tensors.size() == source_outputs.size(),
+                                    "Inconsistent %s tensor presence in a batch for stacking.",
+                                    field_name);
+            transTensorPB(mutable_tensor_pb(), torch::stack(tensors, 0));
+        };
+    serialize_optional_tensors(
+        token_logprobs, [&]() { return flatten_output->mutable_token_logprobs(); }, "token_logprobs");
+    serialize_optional_tensors(
+        top_logprob_token_ids,
+        [&]() { return flatten_output->mutable_top_logprob_token_ids(); },
+        "top_logprob_token_ids");
+    serialize_optional_tensors(top_logprobs, [&]() { return flatten_output->mutable_top_logprobs(); }, "top_logprobs");
 
     RTP_LLM_LOG_DEBUG("transResponse done");
 }

@@ -4,6 +4,7 @@ import logging
 from typing import AsyncGenerator
 
 import grpc
+import torch
 from grpc import StatusCode
 
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
@@ -175,6 +176,8 @@ def trans_input(input_py: GenerateInput):
         input_py.generate_config.return_cum_log_probs
     )
     generate_config_pb.return_all_probs = input_py.generate_config.return_all_probs
+    generate_config_pb.return_logprobs = input_py.generate_config.return_logprobs
+    generate_config_pb.top_logprobs = input_py.generate_config.top_logprobs
     generate_config_pb.return_softmax_probs = (
         input_py.generate_config.return_softmax_probs
     )
@@ -265,6 +268,14 @@ def trans_output(
     logits_index = input_py.generate_config.logits_index
     aux_info_flag = input_py.generate_config.aux_info
 
+    def trans_optional_compact_tensor(tensor_pb, dtype):
+        shape = list(tensor_pb.shape)
+        if not shape:
+            return None
+        if any(dim == 0 for dim in shape):
+            return torch.empty(shape, dtype=dtype)
+        return trans_tensor(tensor_pb)
+
     all_output_ids = (
         trans_tensor(output_pb.output_ids)
         if output_pb.HasField("output_ids")
@@ -304,6 +315,21 @@ def trans_output(
         if output_pb.HasField("all_probs")
         and len(output_pb.all_probs.shape) > 0
         and output_pb.all_probs.shape[0] > 0
+        else None
+    )
+    all_token_logprobs = (
+        trans_optional_compact_tensor(output_pb.token_logprobs, torch.float32)
+        if output_pb.HasField("token_logprobs")
+        else None
+    )
+    all_top_logprob_token_ids = (
+        trans_optional_compact_tensor(output_pb.top_logprob_token_ids, torch.int32)
+        if output_pb.HasField("top_logprob_token_ids")
+        else None
+    )
+    all_top_logprobs = (
+        trans_optional_compact_tensor(output_pb.top_logprobs, torch.float32)
+        if output_pb.HasField("top_logprobs")
         else None
     )
 
@@ -379,6 +405,15 @@ def trans_output(
 
         if all_all_probs is not None:
             output_py.all_probs = all_all_probs[i]
+
+        if all_token_logprobs is not None:
+            output_py.token_logprobs = all_token_logprobs[i]
+
+        if all_top_logprob_token_ids is not None:
+            output_py.top_logprob_token_ids = all_top_logprob_token_ids[i]
+
+        if all_top_logprobs is not None:
+            output_py.top_logprobs = all_top_logprobs[i]
 
         if (
             logits_index is not None

@@ -39,6 +39,17 @@ struct StreamUpdateInfo {
     const torch::Tensor all_hidden_states;
     bool                update_remote_generate = true;
     bool                force_update_info      = false;
+    // Compact raw-target log probabilities for the newly committed tokens.
+    // Shapes: [batch, num_new_tokens], [batch, num_new_tokens, K],
+    // [batch, num_new_tokens, K]. These fields trail the existing positional
+    // aggregate members to keep old update call sites source-compatible.
+    const torch::Tensor token_logprobs;
+    const torch::Tensor top_logprob_token_ids;
+    const torch::Tensor top_logprobs;
+    // Sequence position before this update was committed. GenerateStream fills
+    // this before invoking updateOutput so finish checks can safely truncate a
+    // multi-token window without deriving a start position from requested N.
+    int output_start_pos = -1;
 };
 
 struct StreamSpecUpdateInfo {
@@ -54,6 +65,14 @@ struct StreamSpecUpdateInfo {
     torch::Tensor draft_token_gpu;
     // GPU tensor of the last accepted target token for the next MTP step.
     torch::Tensor target_token_gpu;
+
+    // Compact raw-target log probabilities for the accepted tokens.
+    // Shapes: [batch, num_new_tokens], [batch, num_new_tokens, K],
+    // [batch, num_new_tokens, K]. Non-const so MTP assembly can fill them
+    // after constructing the rest of the update.
+    torch::Tensor token_logprobs;
+    torch::Tensor top_logprob_token_ids;
+    torch::Tensor top_logprobs;
 
     bool update_remote_generate = true;
     bool force_update_info      = false;
@@ -269,10 +288,17 @@ public:
     size_t spIterCount() const;
     void   setSpIterCount(int sp_iter_count);
 
-    const ResourceContext&      resourceContext() const;
-    void                        setKVCache(const BatchKVCacheResource& kv_cache_resource);
-    void                        setLoss(const torch::Tensor& loss);
-    void                        setSoftmaxProbs(const torch::Tensor& softmax_probs, int start_pos);
+    const ResourceContext& resourceContext() const;
+    void                   setKVCache(const BatchKVCacheResource& kv_cache_resource);
+    void                   setLoss(const torch::Tensor& loss);
+    void                   setSoftmaxProbs(const torch::Tensor& softmax_probs, int start_pos);
+    // Logprob D2H is batched by the executor/dispatcher. All tensor arguments
+    // passed here must already be CPU tensors.
+    void                        setLogProbs(const torch::Tensor& token_logprobs,
+                                            const torch::Tensor& top_logprob_token_ids,
+                                            const torch::Tensor& top_logprobs,
+                                            const torch::Tensor& src_batch_indices,
+                                            int                  start_pos);
     const BatchKVCacheResource& kvCache() const;
     BatchKVCacheResource&       kvCacheMutable();
     BatchKVCacheResourcePtr     kvCachePtr();
@@ -304,6 +330,9 @@ public:
         last_hidden_states_ = std::move(hidden_states);
     };
     torch::Tensor        getSoftmaxProbs();
+    torch::Tensor        getTokenLogProbs() const;
+    torch::Tensor        getTopLogprobTokenIds() const;
+    torch::Tensor        getTopLogProbs() const;
     StreamCacheResource& streamCacheResource();
     void                 setPerfTest(bool perf_test_);
     bool                 isPerfTest() const {
@@ -760,6 +789,9 @@ protected:
     torch::Tensor                            cum_log_probs_;
     torch::Tensor                            all_probs_;
     torch::Tensor                            softmax_probs_;
+    torch::Tensor                            token_logprobs_;
+    torch::Tensor                            top_logprob_token_ids_;
+    torch::Tensor                            top_logprobs_;
     torch::Tensor                            loss_;
     torch::Tensor                            last_hidden_states_;
     int                                      loss_index_ = 0;

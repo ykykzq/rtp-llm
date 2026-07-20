@@ -67,6 +67,15 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
                 generate_output.logits = logits_result.narrow(0, i, 1).cpu().clone();
             }
         }
+        if (generate_input_->generate_config->return_logprobs && token_logprobs_.defined()) {
+            RTP_LLM_CHECK(last_output_pos_ >= (size_t)inputLength());
+            const int64_t output_offset = last_output_pos_ - inputLength();
+            RTP_LLM_CHECK(output_offset + output_len <= (size_t)token_logprobs_.size(1));
+            generate_output.token_logprobs = token_logprobs_[i].narrow(0, output_offset, output_len).clone();
+            generate_output.top_logprob_token_ids =
+                top_logprob_token_ids_[i].narrow(0, output_offset, output_len).clone();
+            generate_output.top_logprobs = top_logprobs_[i].narrow(0, output_offset, output_len).clone();
+        }
 
         if (generate_input_->generate_config->return_hidden_states && update_info.hidden_states.defined()) {
             if (update_info.hidden_states.size(0) == 1) {
@@ -183,6 +192,22 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
     }
     if (update_info.all_probs.defined()) {
         all_probs_ = update_info.all_probs.cpu();
+    }
+    if (generate_input_->generate_config->return_logprobs && update_info.token_logprobs.defined()) {
+        RTP_LLM_CHECK(update_info.top_logprob_token_ids.defined());
+        RTP_LLM_CHECK(update_info.top_logprobs.defined());
+        RTP_LLM_CHECK(update_info.token_logprobs.size(1) == update_info.num_new_tokens);
+        const int start_pos =
+            update_info.output_start_pos >= 0 ? update_info.output_start_pos : seqLength() - update_info.num_new_tokens;
+        const int committed_num_new_tokens = std::max(0, seqLength() - start_pos);
+        RTP_LLM_CHECK(committed_num_new_tokens <= update_info.num_new_tokens);
+        if (committed_num_new_tokens > 0) {
+            setLogProbs(update_info.token_logprobs.narrow(1, 0, committed_num_new_tokens),
+                        update_info.top_logprob_token_ids.narrow(1, 0, committed_num_new_tokens),
+                        update_info.top_logprobs.narrow(1, 0, committed_num_new_tokens),
+                        update_info.src_batch_indices,
+                        start_pos);
+        }
     }
 
     // TODO: move it to better position

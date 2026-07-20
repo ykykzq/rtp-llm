@@ -38,7 +38,11 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
     GenerateOutputsPB,
     TensorPB,
 )
-from rtp_llm.utils.base_model_datatypes import GenerateInput, GenerateOutputs, RequestInfo
+from rtp_llm.utils.base_model_datatypes import (
+    GenerateInput,
+    GenerateOutputs,
+    RequestInfo,
+)
 
 
 class FakeStub:
@@ -87,9 +91,9 @@ class FakeModelRpcClient(ModelRpcClient):
     def __init__(self):
         # Call parent __init__ with minimal required parameters
         super().__init__(
-            [],     # addresses: empty list for fake client
-            {},     # client_config: empty dict for fake client
-            0,      # max_rpc_timeout_ms
+            [],  # addresses: empty list for fake client
+            {},  # client_config: empty dict for fake client
+            0,  # max_rpc_timeout_ms
             False,  # decode_entrance
         )
         self.stub = FakeStub()
@@ -204,6 +208,91 @@ class ModelRpcClientTest(TestCase):
         self.assertEqual(input_pb.request_info.trace_id, "trace-from-info")
         self.assertEqual(input_pb.request_info.request_id, "source-request-id")
         self.assertEqual(input_pb.request_info.source_role, "frontend")
+
+    def test_compact_logprobs_config_and_output_roundtrip(self):
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=2),
+            request_id=123,
+            mm_inputs=[],
+        )
+        input_pb = trans_input(input_py)
+        self.assertTrue(input_pb.generate_config.return_logprobs)
+        self.assertEqual(input_pb.generate_config.top_logprobs, 2)
+
+        outputs_pb = GenerateOutputsPB()
+        output_pb = outputs_pb.flatten_output
+        output_pb.finished.append(False)
+        output_pb.output_ids.data_type = TensorPB.DataType.INT32
+        output_pb.output_ids.shape.extend([1, 2])
+        output_pb.output_ids.int32_data = struct.pack("<ii", 10, 11)
+
+        output_pb.token_logprobs.data_type = TensorPB.DataType.FP32
+        output_pb.token_logprobs.shape.extend([1, 2])
+        output_pb.token_logprobs.fp32_data = struct.pack("<ff", -0.1, -0.2)
+
+        output_pb.top_logprob_token_ids.data_type = TensorPB.DataType.INT32
+        output_pb.top_logprob_token_ids.shape.extend([1, 2, 2])
+        output_pb.top_logprob_token_ids.int32_data = struct.pack(
+            "<iiii", 10, 12, 11, 13
+        )
+
+        output_pb.top_logprobs.data_type = TensorPB.DataType.FP32
+        output_pb.top_logprobs.shape.extend([1, 2, 2])
+        output_pb.top_logprobs.fp32_data = struct.pack("<ffff", -0.1, -1.1, -0.2, -1.2)
+
+        result = trans_output(input_py, outputs_pb, StreamState())
+        self.assertEqual(len(result.generate_outputs), 1)
+        output = result.generate_outputs[0]
+        self.assertEqual(output.token_logprobs.shape, torch.Size([2]))
+        self.assertEqual(output.top_logprob_token_ids.shape, torch.Size([2, 2]))
+        self.assertEqual(output.top_logprobs.shape, torch.Size([2, 2]))
+        self.assertTrue(
+            torch.equal(
+                output.top_logprob_token_ids,
+                torch.tensor([[10, 12], [11, 13]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                output.token_logprobs,
+                torch.tensor([-0.1, -0.2], dtype=torch.float32),
+            )
+        )
+
+    def test_compact_logprobs_zero_top_k_output_roundtrip(self):
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=GenerateConfig(return_logprobs=True, top_logprobs=0),
+            request_id=123,
+            mm_inputs=[],
+        )
+
+        outputs_pb = GenerateOutputsPB()
+        output_pb = outputs_pb.flatten_output
+        output_pb.finished.append(False)
+        output_pb.output_ids.data_type = TensorPB.DataType.INT32
+        output_pb.output_ids.shape.extend([1, 2])
+        output_pb.output_ids.int32_data = struct.pack("<ii", 10, 11)
+
+        output_pb.token_logprobs.data_type = TensorPB.DataType.FP32
+        output_pb.token_logprobs.shape.extend([1, 2])
+        output_pb.token_logprobs.fp32_data = struct.pack("<ff", -0.1, -0.2)
+
+        output_pb.top_logprob_token_ids.data_type = TensorPB.DataType.INT32
+        output_pb.top_logprob_token_ids.shape.extend([1, 2, 0])
+        output_pb.top_logprobs.data_type = TensorPB.DataType.FP32
+        output_pb.top_logprobs.shape.extend([1, 2, 0])
+
+        result = trans_output(input_py, outputs_pb, StreamState())
+
+        self.assertEqual(len(result.generate_outputs), 1)
+        output = result.generate_outputs[0]
+        self.assertEqual(output.token_logprobs.shape, torch.Size([2]))
+        self.assertEqual(output.top_logprob_token_ids.shape, torch.Size([2, 0]))
+        self.assertEqual(output.top_logprob_token_ids.dtype, torch.int32)
+        self.assertEqual(output.top_logprobs.shape, torch.Size([2, 0]))
+        self.assertEqual(output.top_logprobs.dtype, torch.float32)
 
     def test_trans_input_request_info_fallback(self):
         input_pb = trans_input(

@@ -24,6 +24,8 @@ namespace rtp_llm {
 
 namespace {
 
+constexpr int64_t kInitialLogprobsHistoryCapacity = 64;
+
 bool useStreamAsyncReserveTokens() {
     static const bool enabled = autil::EnvUtil::getEnv("RTP_LLM_STREAM_ASYNC", false);
     return enabled;
@@ -79,6 +81,20 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     }
     if (generate_input_->generate_config->return_softmax_probs) {
         softmax_probs_ = torch::zeros({(int64_t)init_batch_size, (int64_t)max_seq_len_}, torch::kFloat32);
+    }
+    if (generate_input_->generate_config->return_logprobs) {
+        const int64_t logprobs_batch_size       = maxBatchSize();
+        const int64_t physical_output_capacity  = std::max<int64_t>(max_seq_len_ - inputLength(), 0);
+        const int64_t requested_output_capacity = std::min<int64_t>(
+            std::max<int64_t>(generate_input_->generate_config->max_new_tokens, 0), physical_output_capacity);
+        const int64_t initial_output_capacity =
+            std::min<int64_t>(requested_output_capacity, kInitialLogprobsHistoryCapacity);
+        const int64_t top_logprobs =
+            std::min<int64_t>(std::max<int64_t>(generate_input_->generate_config->top_logprobs, 0), vocab_size_);
+        token_logprobs_ = torch::zeros({logprobs_batch_size, initial_output_capacity}, torch::kFloat32);
+        top_logprob_token_ids_ =
+            torch::zeros({logprobs_batch_size, initial_output_capacity, top_logprobs}, torch::kInt32);
+        top_logprobs_ = torch::zeros({logprobs_batch_size, initial_output_capacity, top_logprobs}, torch::kFloat32);
     }
     if (generate_input_->generate_config->return_all_hidden_states) {
         setReturnLastHiddenStates(true);
@@ -867,7 +883,6 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
                                    + " out of vocab size: " + std::to_string(vocab_size_));
         return;
     }
-
     // update speculative output buffer
     int  target_last_token = new_tokens.data_ptr<int>()[num_new_tokens - 1];
     int* spec_tokens       = sp_output_buffer_->tokens.data_ptr<int>();
@@ -914,6 +929,17 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
                           nxt_cached_len + 1);
     }
 
+    // CompleteTokenIds may truncate the speculative window at max-token
+    // boundaries. Forward only the metadata for tokens that were committed.
+    auto token_logprobs        = update_info.token_logprobs.defined() ?
+                                     update_info.token_logprobs.narrow(1, 0, num_new_tokens) :
+                                     torch::Tensor();
+    auto top_logprob_token_ids = update_info.top_logprob_token_ids.defined() ?
+                                     update_info.top_logprob_token_ids.narrow(1, 0, num_new_tokens) :
+                                     torch::Tensor();
+    auto top_logprobs =
+        update_info.top_logprobs.defined() ? update_info.top_logprobs.narrow(1, 0, num_new_tokens) : torch::Tensor();
+
     // update normal output buffer
     updateOutput({new_tokens,
                   num_new_tokens,
@@ -926,7 +952,11 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
                   torch::Tensor(),
                   torch::Tensor(),
                   update_info.update_remote_generate,
-                  update_info.force_update_info});
+                  update_info.force_update_info,
+                  token_logprobs,
+                  top_logprob_token_ids,
+                  top_logprobs,
+                  old_seq_length});
 
     const int committed_num_new_tokens = std::max(0, seqLength() - old_seq_length);
     if (committed_num_new_tokens > 0) {
@@ -973,7 +1003,25 @@ void GenerateStream::update(const StreamUpdateInfo& update_info) {
     resizeSubGenerateStatus(update_info.new_tokens.size(0));
 
     // TODO(xinfei.sxf) fix this (update_queue)
-    updateOutput(update_info);
+    // Preserve the pre-update sequence position. CompleteTokenIds::update may
+    // clamp requested tokens to maxTokenNum, and needFinish() may later trim a
+    // multi-token window at EOS/stop words.
+    updateOutput({update_info.new_tokens,
+                  update_info.num_new_tokens,
+                  update_info.hidden_states,
+                  update_info.logits,
+                  update_info.softmax_probs,
+                  update_info.cum_log_probs,
+                  update_info.all_probs,
+                  update_info.loss,
+                  update_info.src_batch_indices,
+                  update_info.all_hidden_states,
+                  update_info.update_remote_generate,
+                  update_info.force_update_info,
+                  update_info.token_logprobs,
+                  update_info.top_logprob_token_ids,
+                  update_info.top_logprobs,
+                  old_seq_length});
 
     bool is_done = getStatus() == StreamState::FINISHED;
 
@@ -1121,6 +1169,90 @@ void GenerateStream::setSoftmaxProbs(const torch::Tensor& softmax_probs, int sta
     }
 }
 
+void GenerateStream::setLogProbs(const torch::Tensor& token_logprobs,
+                                 const torch::Tensor& top_logprob_token_ids,
+                                 const torch::Tensor& top_logprobs,
+                                 const torch::Tensor& src_batch_indices,
+                                 int                  start_pos) {
+    RTP_LLM_PROFILE_FUNCTION();
+    RTP_LLM_CHECK(token_logprobs_.defined());
+    RTP_LLM_CHECK(top_logprob_token_ids_.defined());
+    RTP_LLM_CHECK(top_logprobs_.defined());
+    // D2H belongs at the batch executor/dispatcher boundary. Doing it here
+    // would serialize three blocking copies for every stream and every step.
+    RTP_LLM_CHECK(!token_logprobs.is_cuda());
+    RTP_LLM_CHECK(!top_logprob_token_ids.is_cuda());
+    RTP_LLM_CHECK(!top_logprobs.is_cuda());
+    RTP_LLM_CHECK(!src_batch_indices.defined() || !src_batch_indices.is_cuda());
+
+    auto token_logprobs_cpu = token_logprobs.contiguous();
+    auto top_token_ids_cpu  = top_logprob_token_ids.contiguous();
+    auto top_logprobs_cpu   = top_logprobs.contiguous();
+
+    RTP_LLM_CHECK(token_logprobs_cpu.dim() == 2);
+    RTP_LLM_CHECK(top_token_ids_cpu.dim() == 3);
+    RTP_LLM_CHECK(top_logprobs_cpu.dim() == 3);
+    RTP_LLM_CHECK(token_logprobs_cpu.scalar_type() == torch::kFloat32);
+    RTP_LLM_CHECK(top_token_ids_cpu.scalar_type() == torch::kInt32);
+    RTP_LLM_CHECK(top_logprobs_cpu.scalar_type() == torch::kFloat32);
+    RTP_LLM_CHECK(token_logprobs_cpu.size(0) == currentBatchSize());
+    RTP_LLM_CHECK(top_token_ids_cpu.size(0) == token_logprobs_cpu.size(0));
+    RTP_LLM_CHECK(top_logprobs_cpu.size(0) == token_logprobs_cpu.size(0));
+    RTP_LLM_CHECK(top_token_ids_cpu.size(1) == token_logprobs_cpu.size(1));
+    RTP_LLM_CHECK(top_logprobs_cpu.size(1) == token_logprobs_cpu.size(1));
+    RTP_LLM_CHECK(top_token_ids_cpu.size(2) == top_logprob_token_ids_.size(2));
+    RTP_LLM_CHECK(top_logprobs_cpu.size(2) == top_logprobs_.size(2));
+    RTP_LLM_CHECK(start_pos >= inputLength());
+    const int64_t output_start_pos         = start_pos - inputLength();
+    const int64_t num_new_tokens           = token_logprobs_cpu.size(1);
+    const int64_t required_capacity        = output_start_pos + num_new_tokens;
+    const int64_t physical_output_capacity = std::max<int64_t>(max_seq_len_ - inputLength(), 0);
+    RTP_LLM_CHECK(required_capacity <= physical_output_capacity);
+
+    // History starts with a small bounded allocation and grows geometrically
+    // as output is committed, never beyond the prompt-exclusive max_seq_len.
+    if (required_capacity > token_logprobs_.size(1)) {
+        const int64_t old_capacity = token_logprobs_.size(1);
+        const int64_t new_capacity = std::min<int64_t>(
+            physical_output_capacity, std::max<int64_t>(required_capacity, std::max<int64_t>(old_capacity * 2, 1)));
+        auto new_token_logprobs = torch::zeros({token_logprobs_.size(0), new_capacity}, token_logprobs_.options());
+        auto new_top_logprob_token_ids =
+            torch::zeros({top_logprob_token_ids_.size(0), new_capacity, top_logprob_token_ids_.size(2)},
+                         top_logprob_token_ids_.options());
+        auto new_top_logprobs =
+            torch::zeros({top_logprobs_.size(0), new_capacity, top_logprobs_.size(2)}, top_logprobs_.options());
+        if (old_capacity > 0) {
+            new_token_logprobs.narrow(1, 0, old_capacity).copy_(token_logprobs_);
+            new_top_logprob_token_ids.narrow(1, 0, old_capacity).copy_(top_logprob_token_ids_);
+            new_top_logprobs.narrow(1, 0, old_capacity).copy_(top_logprobs_);
+        }
+        token_logprobs_        = std::move(new_token_logprobs);
+        top_logprob_token_ids_ = std::move(new_top_logprob_token_ids);
+        top_logprobs_          = std::move(new_top_logprobs);
+    }
+
+    const int64_t batch_size = token_logprobs_cpu.size(0);
+    if (src_batch_indices.defined() && output_start_pos > 0) {
+        auto src_indices_cpu = src_batch_indices.to(torch::kLong).contiguous();
+        RTP_LLM_CHECK(src_indices_cpu.dim() == 1);
+        RTP_LLM_CHECK(src_indices_cpu.size(0) == batch_size);
+
+        auto token_history = token_logprobs_.narrow(1, 0, output_start_pos).index_select(0, src_indices_cpu).clone();
+        auto id_history =
+            top_logprob_token_ids_.narrow(1, 0, output_start_pos).index_select(0, src_indices_cpu).clone();
+        auto top_history = top_logprobs_.narrow(1, 0, output_start_pos).index_select(0, src_indices_cpu).clone();
+        token_logprobs_.narrow(0, 0, batch_size).narrow(1, 0, output_start_pos).copy_(token_history);
+        top_logprob_token_ids_.narrow(0, 0, batch_size).narrow(1, 0, output_start_pos).copy_(id_history);
+        top_logprobs_.narrow(0, 0, batch_size).narrow(1, 0, output_start_pos).copy_(top_history);
+    }
+
+    token_logprobs_.narrow(0, 0, batch_size).narrow(1, output_start_pos, num_new_tokens).copy_(token_logprobs_cpu);
+    top_logprob_token_ids_.narrow(0, 0, batch_size)
+        .narrow(1, output_start_pos, num_new_tokens)
+        .copy_(top_token_ids_cpu);
+    top_logprobs_.narrow(0, 0, batch_size).narrow(1, output_start_pos, num_new_tokens).copy_(top_logprobs_cpu);
+}
+
 torch::Tensor GenerateStream::getLoss() {
     return loss_;
 }
@@ -1131,6 +1263,18 @@ torch::Tensor GenerateStream::getLastHiddenStates() const {
 
 torch::Tensor GenerateStream::getSoftmaxProbs() {
     return softmax_probs_;
+}
+
+torch::Tensor GenerateStream::getTokenLogProbs() const {
+    return token_logprobs_;
+}
+
+torch::Tensor GenerateStream::getTopLogprobTokenIds() const {
+    return top_logprob_token_ids_;
+}
+
+torch::Tensor GenerateStream::getTopLogProbs() const {
+    return top_logprobs_;
 }
 
 void GenerateStream::setMetricsReporter(kmonitor::MetricsReporterPtr metrics_reporter) {
@@ -1261,7 +1405,11 @@ void GenerateStream::CopyOnWrite(const GenerateStream& other_stream, bool copy_l
     complete_token_ids_ = make_shared<CompleteTokenIds>(*other_stream.complete_token_ids_, share);
     grpc_normal_device_state_pending_ =
         std::make_shared<std::atomic<bool>>(other_stream.hasGrpcNormalDeviceStatePending());
-    cum_log_probs_ = other_stream.cum_log_probs_.clone();
+    cum_log_probs_  = other_stream.cum_log_probs_.clone();
+    token_logprobs_ = other_stream.token_logprobs_.defined() ? other_stream.token_logprobs_.clone() : torch::Tensor();
+    top_logprob_token_ids_ =
+        other_stream.top_logprob_token_ids_.defined() ? other_stream.top_logprob_token_ids_.clone() : torch::Tensor();
+    top_logprobs_ = other_stream.top_logprobs_.defined() ? other_stream.top_logprobs_.clone() : torch::Tensor();
     if (other_stream.calculateLoss() && copy_loss) {
         loss_ = other_stream.loss_.clone();
     } else {

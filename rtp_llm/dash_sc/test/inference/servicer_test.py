@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import struct
 import unittest
 from unittest.mock import MagicMock, patch
@@ -159,6 +160,23 @@ def _finish_reason(chunk) -> int | None:
     for i, out in enumerate(infer.outputs):
         if out.name == "finish_reason":
             return int(struct.unpack("<q", infer.raw_output_contents[i])[0])
+    return None
+
+
+def _fp32_output(chunk, name: str) -> list[float] | None:
+    infer = chunk.infer_response
+    for i, out in enumerate(infer.outputs):
+        if out.name == name:
+            raw = infer.raw_output_contents[i]
+            return list(struct.unpack("<%df" % (len(raw) // 4), raw))
+    return None
+
+
+def _int32_output(chunk, name: str) -> list[int] | None:
+    infer = chunk.infer_response
+    for i, out in enumerate(infer.outputs):
+        if out.name == name:
+            return _unpack_int32_le(infer.raw_output_contents[i])
     return None
 
 
@@ -1366,6 +1384,231 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         # Trailing [128822, 271] is stripped; only the real answer ids survive.
         self.assertEqual(_gen_ids(phase2_chunks[0]), [30, 31, 32])
 
+    async def test_logprobs_stay_aligned_across_term_echo_eos_and_phase2_slices(
+        self,
+    ) -> None:
+        req = self._minimal_request()
+        phase1 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([10, 11, 1, 99], dtype=torch.int32),
+                    token_logprobs=torch.tensor(
+                        [-0.10, -0.11, -0.12, -0.13], dtype=torch.float32
+                    ),
+                    top_logprob_token_ids=torch.tensor(
+                        [[10, 110], [11, 111], [1, 101], [99, 199]],
+                        dtype=torch.int32,
+                    ),
+                    top_logprobs=torch.tensor(
+                        [
+                            [-0.10, -1.10],
+                            [-0.11, -1.11],
+                            [-0.12, -1.12],
+                            [-0.13, -1.13],
+                        ],
+                        dtype=torch.float32,
+                    ),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=3, reuse_len=0),
+                )
+            ]
+        )
+        phase2_pending = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([55], dtype=torch.int32),
+                    token_logprobs=torch.tensor([-0.55], dtype=torch.float32),
+                    top_logprob_token_ids=torch.tensor([[55, 155]], dtype=torch.int32),
+                    top_logprobs=torch.tensor([[-0.55, -1.55]], dtype=torch.float32),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=6, reuse_len=0),
+                )
+            ]
+        )
+        phase2_post_close = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([128822, 271, 20], dtype=torch.int32),
+                    token_logprobs=torch.tensor(
+                        [-0.60, -0.61, -0.20], dtype=torch.float32
+                    ),
+                    top_logprob_token_ids=torch.tensor(
+                        [[128822, 1], [271, 2], [20, 120]], dtype=torch.int32
+                    ),
+                    top_logprobs=torch.tensor(
+                        [[-0.60, -1.60], [-0.61, -1.61], [-0.20, -1.20]],
+                        dtype=torch.float32,
+                    ),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=6, reuse_len=0),
+                )
+            ]
+        )
+        phase2_trailing_eos = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([21, 128822, 271], dtype=torch.int32),
+                    token_logprobs=torch.tensor(
+                        [-0.21, -0.70, -0.71], dtype=torch.float32
+                    ),
+                    top_logprob_token_ids=torch.tensor(
+                        [[21, 121], [128822, 1], [271, 2]], dtype=torch.int32
+                    ),
+                    top_logprobs=torch.tensor(
+                        [[-0.21, -1.21], [-0.70, -1.70], [-0.71, -1.71]],
+                        dtype=torch.float32,
+                    ),
+                    finished=True,
+                    aux_info=AuxInfo(input_len=6, reuse_len=0),
+                )
+            ]
+        )
+        visitor = _MultiStreamVisitor(
+            [
+                _FakeAsyncStream([phase1]),
+                _FakeAsyncStream(
+                    [phase2_pending, phase2_post_close, phase2_trailing_eos]
+                ),
+            ]
+        )
+        tok = _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+
+        chunks = await _drain(
+            iter_real_model_stream_infer(
+                req,
+                [7, 8, 128821],
+                SamplingParams(return_logprobs=True, top_logprobs=2),
+                OtherParams(enable_thinking=True, max_new_think_tokens=2),
+                visitor,
+                rtp_llm_request_id=100,
+                echo_prefix_ids=[128821, 198],
+                tokenizer=tok,
+                generate_env_config=env_cfg,
+                think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+                phase2_request_id_factory=lambda: 200,
+            )
+        )
+
+        self.assertEqual(
+            [_gen_ids(chunk) for chunk in chunks],
+            [
+                [128821],
+                [10, 11],
+                [128822, 271],
+                [20],
+                [21],
+            ],
+        )
+        self.assertEqual(
+            visitor.generate_inputs[0].generate_config.max_thinking_tokens, 2
+        )
+        # Prompt echo is not sampled and has no probability payload. The
+        # injected close delimiter is deterministic under the think-budget
+        # constraint and therefore carries aligned logprob=0 rows.
+        self.assertIsNone(_fp32_output(chunks[0], "token_logprobs"))
+        self.assertIsNone(_int32_output(chunks[0], "top_logprob_token_ids"))
+        self.assertIsNone(_fp32_output(chunks[0], "top_logprobs"))
+        self.assertEqual(_fp32_output(chunks[2], "token_logprobs"), [0.0, 0.0])
+        self.assertEqual(
+            _int32_output(chunks[2], "top_logprob_token_ids"),
+            [128822, 0, 271, 0],
+        )
+        close_top_logprobs = _fp32_output(chunks[2], "top_logprobs")
+        self.assertIsNotNone(close_top_logprobs)
+        assert close_top_logprobs is not None
+        self.assertEqual(close_top_logprobs[0], 0.0)
+        self.assertEqual(close_top_logprobs[2], 0.0)
+        self.assertTrue(math.isinf(close_top_logprobs[1]))
+        self.assertTrue(math.isinf(close_top_logprobs[3]))
+
+        expected = {
+            1: ([-0.10, -0.11], [10, 110, 11, 111]),
+            3: ([-0.20], [20, 120]),
+            4: ([-0.21], [21, 121]),
+        }
+        for idx, (token_probs, top_ids) in expected.items():
+            actual = _fp32_output(chunks[idx], "token_logprobs")
+            self.assertIsNotNone(actual)
+            assert actual is not None
+            for got, want in zip(actual, token_probs):
+                self.assertAlmostEqual(got, want)
+            self.assertEqual(
+                _int32_output(chunks[idx], "top_logprob_token_ids"), top_ids
+            )
+
+    async def test_phase2_pre_close_slice_keeps_matching_logprob_prefix(self) -> None:
+        req = self._minimal_request()
+        phase1 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([10, 1], dtype=torch.int32),
+                    token_logprobs=torch.tensor([-0.10, -0.11]),
+                    top_logprob_token_ids=torch.tensor(
+                        [[10, 110], [1, 101]], dtype=torch.int32
+                    ),
+                    top_logprobs=torch.tensor([[-0.10, -1.10], [-0.11, -1.11]]),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=2, reuse_len=0),
+                )
+            ]
+        )
+        phase2 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([30, 31, 128822, 271], dtype=torch.int32),
+                    token_logprobs=torch.tensor([-0.30, -0.31, -0.60, -0.61]),
+                    top_logprob_token_ids=torch.tensor(
+                        [[30, 130], [31, 131], [128822, 1], [271, 2]],
+                        dtype=torch.int32,
+                    ),
+                    top_logprobs=torch.tensor(
+                        [
+                            [-0.30, -1.30],
+                            [-0.31, -1.31],
+                            [-0.60, -1.60],
+                            [-0.61, -1.61],
+                        ]
+                    ),
+                    finished=True,
+                    aux_info=AuxInfo(input_len=4, reuse_len=0),
+                )
+            ]
+        )
+        visitor = _MultiStreamVisitor(
+            [_FakeAsyncStream([phase1]), _FakeAsyncStream([phase2])]
+        )
+        tok = _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+
+        chunks = await _drain(
+            iter_real_model_stream_infer(
+                req,
+                [7, 8],
+                SamplingParams(return_logprobs=True, top_logprobs=2),
+                OtherParams(enable_thinking=True),
+                visitor,
+                rtp_llm_request_id=100,
+                tokenizer=tok,
+                generate_env_config=env_cfg,
+                think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+                phase2_request_id_factory=lambda: 200,
+            )
+        )
+
+        phase2_chunks = [c for c in chunks if c.infer_response.id.endswith("-2")]
+        self.assertEqual(len(phase2_chunks), 1)
+        self.assertEqual(_gen_ids(phase2_chunks[0]), [30, 31])
+        probs = _fp32_output(phase2_chunks[0], "token_logprobs")
+        self.assertIsNotNone(probs)
+        assert probs is not None
+        self.assertAlmostEqual(probs[0], -0.30)
+        self.assertAlmostEqual(probs[1], -0.31)
+        self.assertEqual(
+            _int32_output(phase2_chunks[0], "top_logprob_token_ids"),
+            [30, 130, 31, 131],
+        )
+
 
 class IterRealModelStreamInferEchoTest(unittest.IsolatedAsyncioTestCase):
     """Echo-prefill integration for ``iter_real_model_stream_infer``."""
@@ -1855,7 +2098,7 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(
             visitor.last_generate_input.generate_config.max_new_tokens,
-            32000,
+            131072,
         )
 
     async def test_max_completion_tokens_non_positive_rejected_before_enqueue(
@@ -1973,7 +2216,7 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(visitor.enqueue_called, 1)
         generate_config = visitor.last_generate_input.generate_config
         self.assertTrue(generate_config.in_think_mode)
-        self.assertEqual(generate_config.max_thinking_tokens, 32000)
+        self.assertEqual(generate_config.max_thinking_tokens, 131072)
 
     async def test_dash_generation_json_object_with_enable_thinking_keeps_both_constraints(
         self,
