@@ -27,6 +27,7 @@ from rtp_llm.utils.concurrency_controller import (
     ConcurrencyController,
     set_global_controller,
 )
+from rtp_llm.utils.oom_diag import install_oom_dump
 from rtp_llm.utils.process_manager import (
     DEFER_FIRST_SIGTERM_ENV,
     DEFER_FIRST_SIGTERM_SECONDS_ENV,
@@ -41,6 +42,16 @@ class BackendStartupInterrupted(Exception):
     pass
 
 
+def _install_hot_hook_runtime(role: str) -> None:
+    try:
+        from rtp_llm.utils.hot_hook_runtime import install_if_enabled
+
+        if install_if_enabled():
+            logging.info("RTP hot hook runtime installed for %s", role)
+    except Exception as e:
+        logging.error("failed to install RTP hot hook runtime for %s: %s", role, e)
+
+
 def local_rank_start(
     global_controller: ConcurrencyController,
     py_env_configs: PyEnvConfigs,
@@ -48,6 +59,7 @@ def local_rank_start(
     pipe_writer=None,
 ):
     """Start local rank with proper signal handling for graceful shutdown"""
+    _install_hot_hook_runtime(f"backend_rank_{world_rank}")
     backend_manager = None
     logging.info(f"[PROCESS_START]Start local rank process")
     start_time = time.time()
@@ -159,6 +171,7 @@ def local_rank_start(
         if py_env_configs.parallelism_config.world_size > 1:
             setproctitle(f"rtp_llm_rank-{local_rank}")
         set_global_controller(global_controller)
+        install_oom_dump()
         backend_manager = BackendManager(py_env_configs)
         if shutdown_pending:
             backend_manager.request_shutdown()
@@ -532,6 +545,7 @@ def start_backend_server(
     py_env_configs: PyEnvConfigs,
     pipe_writer=None,
 ):
+    _install_hot_hook_runtime("backend_manager")
     logging.info(f"[PROCESS_START]Start backend server process")
     setproctitle("rtp_llm_backend_server")
     os.makedirs("logs", exist_ok=True)

@@ -50,6 +50,17 @@ py_test(
 )
 
 py_test(
+    name = "hot_hook_runtime_test",
+    srcs = [
+        "hot_hook_runtime_test.py",
+        "hot_hook_target.py",
+    ],
+    deps = [
+        "//rtp_llm:utils",
+    ],
+)
+
+py_test(
     name = "process_manager_test",
     srcs = [
         "process_manager_test.py",
@@ -86,6 +97,22 @@ py_test(
         "//:rtp_compute_ops",
     ],
     exec_properties = {'gpu':'H20'}
+)
+
+py_test(
+    name = "oom_diag_test",
+    srcs = [
+        "oom_diag_test.py",
+    ],
+    deps = [
+        "//rtp_llm:utils",
+    ],
+    data = [
+        "//:th_transformer",
+        "//:th_transformer_config",
+        "//:rtp_compute_ops",
+    ],
+    exec_properties = {'gpu':'A10'}
 )
 
 py_test(
