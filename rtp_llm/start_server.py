@@ -18,7 +18,12 @@ from rtp_llm.config.server_config_setup import setup_and_configure_server
 from rtp_llm.ops import RoleType, VitSeparation
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.utils.concurrency_controller import init_controller
-from rtp_llm.utils.process_manager import ProcessManager
+from rtp_llm.utils.process_manager import (
+    DEFER_FIRST_SIGTERM_ENV,
+    DEFER_FIRST_SIGTERM_SECONDS_ENV,
+    DEFER_FIRST_SIGTERM_VALUE,
+    ProcessManager,
+)
 
 setup_logging()
 
@@ -39,6 +44,21 @@ def check_server_health(server_port):
         return False
 
 
+def _backend_deferred_sigterm_seconds(py_env_configs: PyEnvConfigs) -> str:
+    timeout = ProcessManager.normalize_shutdown_timeout_seconds(
+        py_env_configs.server_config.shutdown_timeout
+    )
+    return str(ProcessManager.deferred_group_shutdown_timeout_seconds(timeout))
+
+
+def _sync_server_shutdown_timeout(py_env_configs: PyEnvConfigs):
+    py_env_configs.server_config.shutdown_timeout = (
+        ProcessManager.sync_shutdown_timeout_env(
+            py_env_configs.server_config.shutdown_timeout
+        )
+    )
+
+
 @timer_wrapper(description="start backend server")
 def start_backend_server_impl(
     global_controller,
@@ -56,12 +76,29 @@ def start_backend_server_impl(
     pipe_reader, pipe_writer = torch.multiprocessing.Pipe(duplex=False)
     logging.info(f"[PROCESS_SPAWN]Start backend server process outer")
 
-    backend_process = torch.multiprocessing.Process(
-        target=start_backend_server,
-        args=(global_controller, py_env_configs, pipe_writer),
-        name="backend_manager",
+    old_defer = os.environ.get(DEFER_FIRST_SIGTERM_ENV)
+    old_defer_seconds = os.environ.get(DEFER_FIRST_SIGTERM_SECONDS_ENV)
+    _sync_server_shutdown_timeout(py_env_configs)
+    os.environ[DEFER_FIRST_SIGTERM_ENV] = DEFER_FIRST_SIGTERM_VALUE
+    os.environ[DEFER_FIRST_SIGTERM_SECONDS_ENV] = _backend_deferred_sigterm_seconds(
+        py_env_configs
     )
-    backend_process.start()
+    try:
+        backend_process = multiprocessing.Process(
+            target=start_backend_server,
+            args=(global_controller, py_env_configs, pipe_writer),
+            name="backend_manager",
+        )
+        backend_process.start()
+    finally:
+        if old_defer is None:
+            os.environ.pop(DEFER_FIRST_SIGTERM_ENV, None)
+        else:
+            os.environ[DEFER_FIRST_SIGTERM_ENV] = old_defer
+        if old_defer_seconds is None:
+            os.environ.pop(DEFER_FIRST_SIGTERM_SECONDS_ENV, None)
+        else:
+            os.environ[DEFER_FIRST_SIGTERM_SECONDS_ENV] = old_defer_seconds
     pipe_writer.close()  # Parent process closes write end
 
     # Create check_ready_fn for pipe-based health check
@@ -346,6 +383,7 @@ def start_server(py_env_configs: PyEnvConfigs):
         py_env_configs.concurrency_config,
         dp_size=py_env_configs.parallelism_config.dp_size,
     )
+    _sync_server_shutdown_timeout(py_env_configs)
 
     # Create process manager with config values
     process_manager = ProcessManager(
@@ -379,14 +417,14 @@ def start_server(py_env_configs: PyEnvConfigs):
             backend_process = start_backend_server_impl(
                 global_controller, py_env_configs, process_manager
             )
-            process_manager.add_process(backend_process)
+            process_manager.add_process(backend_process, shutdown_group="backend")
 
         if py_env_configs.role_config.role_type != RoleType.VIT:
             # vit has its own frontend server
             frontend_process = start_frontend_server_impl(
                 global_controller, py_env_configs, process_manager
             )
-            process_manager.add_processes(frontend_process)
+            process_manager.add_processes(frontend_process, shutdown_group="frontend")
 
         if not process_manager.run_health_checks():
             logging.error("[START_SERVER] Health checks failed")
@@ -394,7 +432,13 @@ def start_server(py_env_configs: PyEnvConfigs):
 
     except Exception as e:
         logging.error(f"start failed, trace: {traceback.format_exc()}")
-        process_manager.graceful_shutdown()
+        # If a SIGTERM/SIGINT already triggered shutdown before this exception,
+        # the exception is a side-effect of the signal (health check tripped on
+        # shutdown_requested), not a real failure — preserve graceful exit
+        # semantics. Otherwise mark failure so the process manager uses bounded
+        # timeouts and the parent exits non-zero.
+        if not process_manager.shutdown_requested:
+            process_manager.request_failure_shutdown()
     finally:
         process_manager.monitor_and_release_processes()
 
