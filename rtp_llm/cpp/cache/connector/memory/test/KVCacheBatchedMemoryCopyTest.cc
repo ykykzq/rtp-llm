@@ -38,6 +38,49 @@ BlockDependency rootDep(uint32_t ordinal = 0) {
     return dep;
 }
 
+void addTaggedGpuBlocks(MemoryOperationRequestPB::CopyItem&                      item,
+                        const std::vector<KVCacheMemoryConnector::LayerTagSlot>& slots,
+                        const std::vector<BlockIdxType>&                         block_ids) {
+    ASSERT_EQ(block_ids.size(), slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        auto* tagged_block = item.add_tagged_gpu_blocks();
+        tagged_block->set_layer_id(slots[i].layer_id);
+        tagged_block->set_tag(slots[i].tag);
+        tagged_block->set_block_id(block_ids[i]);
+    }
+}
+
+TEST(KVCacheMemoryProtocolTest, TaggedBlocksAreReorderedByLocalLayerAndTag) {
+    std::vector<KVCacheMemoryConnector::LayerTagSlot> slots = {
+        {0, "linear", 0, 16},
+        {0, "full", 1, 32},
+    };
+    MemoryOperationRequestPB::CopyItem item;
+    auto*                              full = item.add_tagged_gpu_blocks();
+    full->set_layer_id(0);
+    full->set_tag("full");
+    full->set_block_id(7);
+    auto* linear = item.add_tagged_gpu_blocks();
+    linear->set_layer_id(0);
+    linear->set_tag("linear");
+    linear->set_block_id(3);
+
+    const auto gpu_blocks = KVCacheMemoryConnector::normalizeCopyItemGpuBlocks(item, slots);
+    ASSERT_EQ(gpu_blocks.size(), 2u);
+    EXPECT_EQ(gpu_blocks[0], 3);
+    EXPECT_EQ(gpu_blocks[1], 7);
+}
+
+TEST(KVCacheMemoryProtocolTest, TaglessBlocksAreAlwaysRejected) {
+    std::vector<KVCacheMemoryConnector::LayerTagSlot> slots = {
+        {0, "linear", 0, 16},
+        {0, "full", 1, 32},
+    };
+    MemoryOperationRequestPB::CopyItem item;
+
+    EXPECT_ANY_THROW(KVCacheMemoryConnector::normalizeCopyItemGpuBlocks(item, slots));
+}
+
 ModelConfig makeDsv4ProModelConfig() {
     ModelConfig mc;
     mc.num_layers                                                = 61;
@@ -229,11 +272,7 @@ size_t sumBlockInfosBytes(const std::vector<BlockInfo>& infos) {
 }
 
 void initResourceGroupsForConfig(KVCacheResource& resource, const CacheConfig& config) {
-    resource.initGroups(config.groupNums(),
-                        static_cast<int>(config.layer_all_num),
-                        config.layerGroupIdsSnapshot(),
-                        /*kernel_blocks_per_kv_block=*/1,
-                        config.groupTypesSnapshot());
+    resource.initGroups(config.topologyPtr());
 }
 
 void setGroupStridesForConfig(CacheConfig&               config,
@@ -258,6 +297,23 @@ void setBlockBytes(const BlockInfo& b, size_t byte_offset, size_t byte_len, char
     } else {
         memset(addr, c, byte_len);
     }
+}
+
+void enqueueBlockBytes(const BlockInfo& b, size_t byte_offset, size_t byte_len, char c) {
+    ASSERT_NE(b.addr, nullptr);
+    ASSERT_LE(byte_offset + byte_len, b.size_bytes);
+    auto* addr = static_cast<char*>(b.addr) + byte_offset;
+    if (b.is_cuda) {
+        const auto rc = cudaMemset(addr, c, byte_len);
+        ASSERT_EQ(rc, cudaSuccess) << cudaGetErrorString(rc);
+    } else {
+        memset(addr, c, byte_len);
+    }
+}
+
+void synchronizeCudaDevice() {
+    const auto sync_rc = cudaDeviceSynchronize();
+    ASSERT_EQ(sync_rc, cudaSuccess) << cudaGetErrorString(sync_rc);
 }
 
 void verifyBlockBytesEq(const BlockInfo& b, size_t byte_offset, size_t byte_len, char expected) {
@@ -290,11 +346,79 @@ void setBlockInfosContent(const std::vector<BlockInfo>& infos, char c) {
     }
 }
 
+void enqueueBlockInfosContent(const std::vector<BlockInfo>& infos, char c) {
+    for (const auto& b : infos) {
+        if (b.addr && b.size_bytes > 0) {
+            enqueueBlockBytes(b, /*byte_offset=*/0, b.size_bytes, c);
+        }
+    }
+}
+
 void verifyBlockInfosContent(const std::vector<BlockInfo>& infos, char c) {
     for (const auto& b : infos) {
         if (b.addr && b.size_bytes > 0) {
             verifyBlockBytesEq(b, /*byte_offset=*/0, b.size_bytes, c);
         }
+    }
+}
+
+struct BlockBytesExpectation {
+    BlockInfo block;
+    char      expected{0};
+};
+
+struct CudaHostDeleter {
+    void operator()(void* ptr) const {
+        if (ptr != nullptr) {
+            cudaFreeHost(ptr);
+        }
+    }
+};
+
+void verifyBlockBytesEqBatch(const std::vector<BlockBytesExpectation>& expectations) {
+    size_t total_bytes = 0;
+    for (const auto& expectation : expectations) {
+        ASSERT_NE(expectation.block.addr, nullptr);
+        total_bytes += expectation.block.size_bytes;
+    }
+    ASSERT_GT(total_bytes, 0u);
+
+    void*      raw_data = nullptr;
+    const auto alloc_rc = cudaMallocHost(&raw_data, total_bytes);
+    ASSERT_EQ(alloc_rc, cudaSuccess) << cudaGetErrorString(alloc_rc);
+    std::unique_ptr<void, CudaHostDeleter> data(raw_data);
+
+    size_t offset   = 0;
+    bool   has_cuda = false;
+    for (const auto& expectation : expectations) {
+        const auto& block = expectation.block;
+        auto*       dst   = static_cast<char*>(data.get()) + offset;
+        if (block.is_cuda) {
+            const auto copy_rc = cudaMemcpyAsync(dst, block.addr, block.size_bytes, cudaMemcpyDeviceToHost);
+            ASSERT_EQ(copy_rc, cudaSuccess) << cudaGetErrorString(copy_rc);
+            has_cuda = true;
+        } else {
+            memcpy(dst, block.addr, block.size_bytes);
+        }
+        offset += block.size_bytes;
+    }
+    if (has_cuda) {
+        const auto sync_rc = cudaStreamSynchronize(nullptr);
+        ASSERT_EQ(sync_rc, cudaSuccess) << cudaGetErrorString(sync_rc);
+    }
+
+    offset = 0;
+    for (const auto& expectation : expectations) {
+        const auto* actual   = static_cast<const unsigned char*>(data.get()) + offset;
+        size_t      mismatch = 0;
+        for (; mismatch < expectation.block.size_bytes; ++mismatch) {
+            if (actual[mismatch] != static_cast<unsigned char>(expectation.expected)) {
+                break;
+            }
+        }
+        ASSERT_EQ(mismatch, expectation.block.size_bytes)
+            << "mismatch at aggregate byte offset " << offset + mismatch << " expect '" << expectation.expected << "'";
+        offset += expectation.block.size_bytes;
     }
 }
 
@@ -383,6 +507,21 @@ public:
         return convertIndexToBuffer(layer_id, group_id, block_id);
     }
 
+    BlockAddrInfo convertIndexToAddrByTag(int layer_id, const std::string& tag, int block_id) const override {
+        return convertIndexToAddr(layer_id, config_.groupIdForLayerTag(layer_id, tag), block_id);
+    }
+
+    std::vector<BlockInfo>
+    convertIndexToBufferByTag(int layer_id, const std::string& tag, int block_id) const override {
+        return convertIndexToBuffer(layer_id, config_.groupIdForLayerTag(layer_id, tag), block_id);
+    }
+
+    std::vector<BlockInfo> convertIndexToBufferByTag(
+        int layer_id, const std::string& tag, int block_id, int partition_count, int partition_id) const override {
+        return convertIndexToBuffer(
+            layer_id, config_.groupIdForLayerTag(layer_id, tag), block_id, partition_count, partition_id);
+    }
+
     std::shared_ptr<KVCacheResource> incrKVCacheRef(const KVCacheResource&, const CacheKeysType&, bool) override {
         return nullptr;
     }
@@ -391,8 +530,10 @@ public:
         return {};
     }
 
-    bool
-    updateKVBlock(const BatchKVCacheResourcePtr&, const std::vector<int>&, bool, std::vector<BlockIdPair>&) override {
+    bool updateKVBlock(const BatchKVCacheResourcePtr&,
+                       const std::vector<int>&,
+                       bool,
+                       std::vector<TaggedBlockIdPair>&) override {
         return false;
     }
 
@@ -528,7 +669,6 @@ void runDsv4TypedStagedCopyRoundTrip(const std::set<int>& host_groups) {
     const std::vector<BlockIdxType> request_mem_blocks{static_cast<BlockIdxType>(mem_blocks[1]),
                                                        static_cast<BlockIdxType>(mem_blocks[0])};
 
-    MemoryOperationRequestPB               req;
     std::vector<std::vector<BlockIdxType>> gpu_block_sets(request_mem_blocks.size(),
                                                           std::vector<BlockIdxType>(slots.size(), NULL_BLOCK_IDX));
     BlockIdxType                           next_gpu_block = 1;
@@ -539,14 +679,14 @@ void runDsv4TypedStagedCopyRoundTrip(const std::set<int>& host_groups) {
     }
     ASSERT_LT(next_gpu_block, static_cast<BlockIdxType>(config.block_num));
     ASSERT_EQ(gpu_block_sets.size(), request_mem_blocks.size());
+    MemoryOperationRequestPB request;
     for (size_t block_idx = 0; block_idx < request_mem_blocks.size(); ++block_idx) {
-        auto* item = req.add_copy_items();
-        item->set_mem_block(request_mem_blocks[block_idx]);
-        item->set_is_complete(true);
         ASSERT_EQ(gpu_block_sets[block_idx].size(), slots.size());
-        for (const auto block : gpu_block_sets[block_idx]) {
-            item->add_gpu_blocks(block);
-        }
+        auto* item = request.add_copy_items();
+        item->set_mem_block(request_mem_blocks[block_idx]);
+        item->set_cache_block_kind(MemoryOperationRequestPB::COMPLETE_KV);
+        item->set_is_complete(true);
+        addTaggedGpuBlocks(*item, slots, gpu_block_sets[block_idx]);
     }
 
     for (size_t block_idx = 0; block_idx < request_mem_blocks.size(); ++block_idx) {
@@ -554,7 +694,7 @@ void runDsv4TypedStagedCopyRoundTrip(const std::set<int>& host_groups) {
         ASSERT_EQ(mem_bufs.size(), 1u);
         const auto& mem_buffer = mem_bufs[0];
         ASSERT_NE(mem_buffer.addr, nullptr);
-        setBlockBytes(mem_buffer, /*byte_offset=*/0, mem_buffer.size_bytes, '#');
+        enqueueBlockBytes(mem_buffer, /*byte_offset=*/0, mem_buffer.size_bytes, '#');
 
         size_t byte_off = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
@@ -564,13 +704,17 @@ void runDsv4TypedStagedCopyRoundTrip(const std::set<int>& host_groups) {
                 allocator->convertIndexToBuffer(slot.layer_id, slot.group_id, gpu_block_sets[block_idx][i]);
             ASSERT_GT(sumBlockInfosBytes(gpu_bufs), 0u);
             ASSERT_LE(sumBlockInfosBytes(gpu_bufs), slot.stride_bytes);
-            setBlockInfosContent(gpu_bufs, tag);
-            setBlockBytes(mem_buffer, byte_off, sumBlockInfosBytes(gpu_bufs), 0);
+            enqueueBlockInfosContent(gpu_bufs, tag);
+            enqueueBlockBytes(mem_buffer, byte_off, sumBlockInfosBytes(gpu_bufs), 0);
             byte_off += slot.stride_bytes;
         }
     }
+    synchronizeCudaDevice();
 
-    ASSERT_TRUE(connector->tryCopyCacheWithStagedMemoryCopy(req, KVCacheMemoryConnector::CopyDirection::D2H, slots));
+    request.set_copy_direction(MemoryOperationRequestPB::D2H);
+    MemoryOperationResponsePB d2h_response;
+    ASSERT_TRUE(connector->copyCache(request, d2h_response));
+    ASSERT_TRUE(d2h_response.success());
 
     for (size_t block_idx = 0; block_idx < request_mem_blocks.size(); ++block_idx) {
         const auto mem_bufs = memory_pool->convertIndexToBuffer(0, request_mem_blocks[block_idx]);
@@ -605,22 +749,33 @@ void runDsv4TypedStagedCopyRoundTrip(const std::set<int>& host_groups) {
             const char  tag  = copyTag(1000 + block_idx * slots.size() + i);
             const auto  gpu_bufs =
                 allocator->convertIndexToBuffer(slot.layer_id, slot.group_id, gpu_block_sets[block_idx][i]);
-            setBlockInfosContent(gpu_bufs, 0);
-            setBlockBytes(mem_buffer, byte_off, sumBlockInfosBytes(gpu_bufs), tag);
+            enqueueBlockInfosContent(gpu_bufs, 0);
+            enqueueBlockBytes(mem_buffer, byte_off, sumBlockInfosBytes(gpu_bufs), tag);
             byte_off += slot.stride_bytes;
         }
     }
+    synchronizeCudaDevice();
 
-    ASSERT_TRUE(connector->tryCopyCacheWithStagedMemoryCopy(req, KVCacheMemoryConnector::CopyDirection::H2D, slots));
+    request.set_copy_direction(MemoryOperationRequestPB::H2D);
+    MemoryOperationResponsePB h2d_response;
+    ASSERT_TRUE(connector->copyCache(request, h2d_response));
+    ASSERT_TRUE(h2d_response.success());
 
+    std::vector<BlockBytesExpectation> gpu_expectations;
     for (size_t block_idx = 0; block_idx < request_mem_blocks.size(); ++block_idx) {
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& slot = slots[i];
             const auto  gpu_bufs =
                 allocator->convertIndexToBuffer(slot.layer_id, slot.group_id, gpu_block_sets[block_idx][i]);
-            verifyBlockInfosContent(gpu_bufs, copyTag(1000 + block_idx * slots.size() + i));
+            for (const auto& gpu_buf : gpu_bufs) {
+                if (gpu_buf.addr != nullptr && gpu_buf.size_bytes > 0) {
+                    gpu_expectations.push_back(
+                        BlockBytesExpectation{gpu_buf, copyTag(1000 + block_idx * slots.size() + i)});
+                }
+            }
         }
     }
+    verifyBlockBytesEqBatch(gpu_expectations);
 }
 
 TEST(KVCacheBatchedMemoryCopyTest, Dsv4TypedLayoutUsesStagedCopyForD2HAndH2D) {
@@ -954,16 +1109,16 @@ TEST(KVCacheBatchedMemoryCopyTest, PrefixTreeBlockZeroAndNullSlotsAreNotCopiedFo
     item->set_backing_type(MemoryOperationRequestPB::MEMORY);
     item->set_cache_block_kind(MemoryOperationRequestPB::STATE_SWA_KV);
     item->set_is_complete(true);
+    std::vector<BlockIdxType> gpu_blocks(slots.size(), NULL_BLOCK_IDX);
     for (size_t i = 0; i < slots.size(); ++i) {
         if (i == state_slots[0]) {
-            item->add_gpu_blocks(valid_gpu_block);
+            gpu_blocks[i] = valid_gpu_block;
         } else if (i == state_slots[1]) {
-            item->add_gpu_blocks(0);
-        } else {
-            item->add_gpu_blocks(NULL_BLOCK_IDX);
+            gpu_blocks[i] = 0;
         }
         item->add_slot_valid_mask(i == state_slots[0] || i == state_slots[1] || i == state_slots[2] ? 1 : 0);
     }
+    addTaggedGpuBlocks(*item, slots, gpu_blocks);
 
     MemoryOperationResponsePB response;
     ASSERT_TRUE(connector->copyCache(request, response));
@@ -1074,10 +1229,12 @@ TEST(KVCacheBatchedMemoryCopyTest, PrefixTreeD2HMergeSourceKeepsOldSlotsAndOverl
     item->set_backing_type(MemoryOperationRequestPB::MEMORY);
     item->set_cache_block_kind(MemoryOperationRequestPB::STATE_SWA_KV);
     item->set_is_complete(true);
+    std::vector<BlockIdxType> gpu_blocks(slots.size(), NULL_BLOCK_IDX);
     for (size_t i = 0; i < slots.size(); ++i) {
-        item->add_gpu_blocks(i == state_slots[1] ? new_gpu_block : NULL_BLOCK_IDX);
+        gpu_blocks[i] = i == state_slots[1] ? new_gpu_block : NULL_BLOCK_IDX;
         item->add_slot_valid_mask(i == state_slots[0] || i == state_slots[1] ? 1 : 0);
     }
+    addTaggedGpuBlocks(*item, slots, gpu_blocks);
 
     MemoryOperationResponsePB response;
     ASSERT_TRUE(connector->copyCache(request, response));
