@@ -9,6 +9,7 @@ import torch
 
 from rtp_llm.model_loader.loader import ModelLoader
 from rtp_llm.model_loader.model_weight_info import ModelWeights
+from rtp_llm.model_loader.tensor_source import TensorSource
 
 # Assuming these imports are from your project and accessible
 from rtp_llm.model_loader.weight_module import WeightModule
@@ -213,6 +214,16 @@ class WeightManager:
                 f"Failed to build tensor from IPC description '{desc}' using method '{method}'. Tensor is None."
             )
 
+        self.update_from_tensor(stored_name, tensor)
+
+    def update_from_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        """Apply an already-materialized tensor to the live model weights.
+
+        Expects the complete, unsharded tensor; TP/PP sharding is applied here
+        according to rtp-llm's own parallelism configuration.
+        """
+        stored_name: str = name
+
         logging.info(
             f"update weight request: {name}, shape: {tensor.shape}, device: {tensor.device}, dtype: {tensor.dtype}"
         )
@@ -283,3 +294,136 @@ class WeightManager:
                     )
 
             self._working_stream.synchronize()
+
+    def _build_receptor_index(self):
+        """Index every leaf receptor by the set of checkpoint tensor names it consumes.
+
+        Used by update_from_hf_tensors so a receptor fires exactly when all of its HF
+        source tensors have arrived (e.g. in_proj_qkv + in_proj_z -> in_proj_qkvz).
+
+        Composites are expanded to their leaves: indexing one as a unit would make it wait
+        for every leaf's source at once, so a single name the caller never sends would
+        strand the whole group.
+        """
+        load_config = self._weights_loader.get_load_config()
+        index = []
+        for entry in self._weight_module.weights:
+            for receptor in entry.get_components():
+                index.append(
+                    (
+                        frozenset(receptor.get_tensor_names(None, load_config)),
+                        receptor,
+                        None,
+                    )
+                )
+        for layer_id, entries in enumerate(self._weight_module.layer_weights):
+            for entry in entries:
+                for receptor in entry.get_components():
+                    index.append(
+                        (
+                            frozenset(receptor.get_tensor_names(layer_id, load_config)),
+                            receptor,
+                            layer_id,
+                        )
+                    )
+        logging.info(
+            f"receptor index: {len(index)} leaf receptors over "
+            f"{len(self._weight_module.layer_weights)} layers"
+        )
+        return index
+
+    def update_from_hf_tensors(self, named_tensors, is_last: bool = False) -> None:
+        """Apply trained weights streamed under their original HuggingFace names.
+
+        Unlike update_from_tensor (one internal tensor per call), this path lets rtp-llm's
+        own receptor machinery fuse/reorder multiple source tensors (qkvz, ba, ffn gate/up),
+        which is required for Qwen3.5's linear-attention layers. Sources are buffered until a
+        receptor's full source set is present, then consumed.
+
+        The incoming tensors are only borrowed for the duration of the call, so anything
+        still awaiting its fusion partners is copied before returning. Pass is_last on the
+        final batch of a round: no partner can arrive after it, so a non-empty buffer then
+        means those copies would stay resident for the life of the process.
+        """
+        with self._lock:
+            if getattr(self, "_receptor_index", None) is None:
+                self._receptor_index = self._build_receptor_index()
+            if not hasattr(self, "_hf_buffer"):
+                self._hf_buffer = {}
+
+            for name, tensor in named_tensors:
+                self._hf_buffer[name] = tensor
+                self._hf_round_total = getattr(self, "_hf_round_total", 0) + 1
+
+            load_config = self._weights_loader.get_load_config()
+            device = str(self._device)
+            source = _DictTensorSource(self._hf_buffer)
+
+            with torch.cuda.stream(self._working_stream):
+                progress = True
+                while progress:
+                    progress = False
+                    for needed, receptor, layer_id in self._receptor_index:
+                        if not needed or not needed.issubset(self._hf_buffer.keys()):
+                            continue
+                        loaded = receptor.load(source, layer_id, device, load_config)
+                        for wname, data in loaded.items():
+                            if layer_id is None:
+                                if wname in self._non_owned_global_weights:
+                                    continue
+                                self._weights.update_global_weight(
+                                    name=wname, data=data
+                                )
+                            else:
+                                self._weights.update_layer_weight(
+                                    layer_id=layer_id, name=wname, data=data
+                                )
+                        for src_name in needed:
+                            self._hf_buffer.pop(src_name, None)
+                        progress = True
+                self._working_stream.synchronize()
+
+            if is_last:
+                round_total = getattr(self, "_hf_round_total", 0)
+                self._hf_round_total = 0
+                if self._hf_buffer:
+                    stranded = sorted(self._hf_buffer)
+                    self._hf_buffer.clear()
+                    for probe in stranded[:3]:
+                        referencing = [
+                            sorted(needed)
+                            for needed, _, _ in self._receptor_index
+                            if probe in needed
+                        ]
+                        logging.warning(
+                            f"stranded {probe!r} referenced by {len(referencing)} entry(ies): {referencing[:2]}"
+                        )
+                    detail = (
+                        f"{len(stranded)} of {round_total} streamed weight(s) matched no receptor "
+                        f"among {len(self._receptor_index)} indexed: {stranded[:30]}"
+                    )
+                    if round_total and len(stranded) * 4 > round_total:
+                        raise KeyError(f"weight name mapping is broken: {detail}")
+                    logging.warning(f"dropping {detail}")
+
+            for name, tensor in self._hf_buffer.items():
+                self._hf_buffer[name] = tensor.clone()
+
+
+class _DictTensorSource(TensorSource):
+    """In-memory TensorSource over a {checkpoint_name: tensor} dict for RL weight updates."""
+
+    def __init__(self, buffer: Mapping[str, torch.Tensor]) -> None:
+        self._buffer = buffer
+
+    def load_tensor(self, name: str, data_type: Any = torch.float16):
+        tensor = self._buffer[name]
+        if tensor.is_floating_point() and data_type is not None:
+            tensor = tensor.to(data_type)
+        return [tensor]
+
+    def has_tensor(self, name: str) -> bool:
+        return name in self._buffer
+
+    def get_database(self):
+        return None
