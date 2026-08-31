@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 #include "autil/EnvUtil.h"
@@ -445,6 +446,24 @@ void RtpLLMOp::stop() {
     }
 }
 
+void RtpLLMOp::clearKVCache() {
+    if (!model_rpc_service_) {
+        throw std::runtime_error("clear_kv_cache called before the rtp-llm service was initialized");
+    }
+    if (const auto requests = model_rpc_service_->onflightRequestNum(); requests != 0) {
+        throw std::runtime_error("clear_kv_cache refused while requests are in flight: "
+                                 + std::to_string(requests));
+    }
+    const auto engine = model_rpc_service_->getEngine();
+    if (!engine) {
+        throw std::runtime_error("clear_kv_cache called with a null engine");
+    }
+    const auto cache_manager = engine->getCacheManager();
+    if (!cache_manager || !cache_manager->clearReusableCache()) {
+        throw std::runtime_error("clear_kv_cache refused: active/resident cache resources remain");
+    }
+}
+
 RtpLLMOp::~RtpLLMOp() {
     stop();
 }
@@ -476,7 +495,8 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("world_info"),
              py::arg("tokenizer"),
              py::arg("render"))
-        .def("stop", &RtpLLMOp::stop);
+        .def("stop", &RtpLLMOp::stop)
+        .def("clear_kv_cache", &RtpLLMOp::clearKVCache);
 }
 
 }  // namespace rtp_llm

@@ -440,6 +440,16 @@ size_t SharedBlockCache::size() const {
     return lru_cache_.size();
 }
 
+size_t SharedBlockCache::residentSize() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    size_t                     resident = 0;
+    for (const auto& [cache_key, item] : lru_cache_.items()) {
+        (void)cache_key;
+        resident += item.is_resident ? 1 : 0;
+    }
+    return resident;
+}
+
 std::vector<CacheKeyType> SharedBlockCache::allCacheKeys() const {
     std::lock_guard<std::mutex> lock(mu_);
     std::vector<CacheKeyType>   keys;

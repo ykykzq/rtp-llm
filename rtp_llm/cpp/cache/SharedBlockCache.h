@@ -98,6 +98,10 @@ public:
 
     size_t size() const;
 
+    // Resident entries are owned by an active request and must not be evicted
+    // during a model-weight transition.
+    size_t residentSize() const;
+
     std::vector<CacheKeyType> allCacheKeys() const;
 
     int64_t version() const;

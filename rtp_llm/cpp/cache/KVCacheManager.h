@@ -104,6 +104,13 @@ public:
     size_t                  notInUseBlocksNum() const;
     BatchKVCacheResourcePtr popBlocksFromCache(size_t min_blocks_to_free);
     void                    blockCacheFree(const BatchKVCacheResourcePtr& batch_kv_cache_resource);
+
+    // Evict every non-resident device-cache entry and return its blocks to the
+    // free lists. The backing KV pool remains allocated. Returns false when a
+    // request/connector/resident entry still owns a block, or when eviction is
+    // incomplete.
+    bool clearReusableCache();
+
     size_t                  availableTokensNum() const;
     size_t                  totalBlocksNum() const;
     size_t                  maxAvailableTokensNum() const;

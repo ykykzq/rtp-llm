@@ -511,6 +511,48 @@ void KVCacheManager::blockCacheFree(const BatchKVCacheResourcePtr& batch_kv_cach
     allocator_->blockCacheFree(batch_kv_cache_resource);
 }
 
+bool KVCacheManager::clearReusableCache() {
+    if (!allocator_) {
+        RTP_LLM_LOG_WARNING("clearReusableCache refused: allocator is null");
+        return false;
+    }
+
+    const auto request_refs      = allocator_->requestRefBlocksNum();
+    const auto connector_refs    = allocator_->connectorRefBlocksNum();
+    const auto active_connectors = hasActiveConnectors();
+    if (request_refs != 0 || connector_refs != 0 || active_connectors) {
+        RTP_LLM_LOG_WARNING(
+            "clearReusableCache refused: request_refs=%zu connector_refs=%zu active_connectors=%d",
+            request_refs,
+            connector_refs,
+            active_connectors);
+        return false;
+    }
+
+    const auto shared_cache = allocator_->sharedBlockCache();
+    if (!shared_cache) {
+        return allocator_->blockCacheRefBlocksNum() == 0;
+    }
+    if (const auto resident = shared_cache->residentSize(); resident != 0) {
+        RTP_LLM_LOG_WARNING("clearReusableCache refused: %zu resident cache entries remain", resident);
+        return false;
+    }
+
+    // evictAndFree() removes each key mapping first and releases every group
+    // block (FULL, LINEAR, and SWA) directly to its pool. Request/connector
+    // references are independent counters, so active resources stay intact.
+    shared_cache->evictAndFree(std::numeric_limits<size_t>::max());
+
+    const auto remaining_cache_refs = allocator_->blockCacheRefBlocksNum();
+    if (!shared_cache->empty() || remaining_cache_refs != 0) {
+        RTP_LLM_LOG_ERROR("clearReusableCache incomplete: cache_entries=%zu block_cache_refs=%zu",
+                          shared_cache->size(),
+                          remaining_cache_refs);
+        return false;
+    }
+    return true;
+}
+
 size_t KVCacheManager::availableTokensNum() const {
     return allocator_->availableTokensNum();
 }
