@@ -16,6 +16,16 @@ filegroup(
 )
 
 py_test(
+    name = "swizzle_utils_test",
+    srcs = [
+        "swizzle_utils_test.py",
+    ],
+    deps = [
+        "//rtp_llm:utils",
+    ],
+)
+
+py_test(
     name = "jit_cache_manager_test",
     size = "large",
     srcs = [
@@ -213,4 +223,14 @@ py_test(
         "//:rtp_compute_ops",
     ],
     exec_properties = {'gpu':'A10'}
+)
+
+py_test(
+    name = "backend_registry_test",
+    srcs = [
+        "backend_registry_test.py",
+    ],
+    deps = [
+        "//rtp_llm:utils",
+    ],
 )

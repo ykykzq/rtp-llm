@@ -167,6 +167,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
 }
 
 void GenerateStream::resetBeginTime(int64_t begin_time_us) {
+    std::lock_guard<std::mutex> lock(*mutex_);
     begin_time_us_               = begin_time_us;
     wait_time_us_                = 0;
     scheduler_enqueue_time_us_   = 0;
@@ -176,6 +177,9 @@ void GenerateStream::resetBeginTime(int64_t begin_time_us) {
     first_running_time_us_       = 0;
     loading_cache_latency_us_    = 0;
     load_done_to_running_us_     = 0;
+    if (running_started_) {
+        running_started_time_us_ = begin_time_us;
+    }
 }
 
 bool GenerateStream::hasCacheKeys() const {
@@ -768,8 +772,16 @@ StreamState GenerateStream::moveToNext() {
         state                 = generate_status_->moveToNext();
         const auto new_status = getStatus();
 
-        if (old_status == StreamState::WAITING && new_status != StreamState::WAITING) {
-            wait_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds() - begin_time_us_;
+        if ((old_status == StreamState::WAITING && new_status != StreamState::WAITING)
+            || (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_)) {
+            const auto transition_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+            if (old_status == StreamState::WAITING && new_status != StreamState::WAITING) {
+                wait_time_us_ = transition_time_us - begin_time_us_;
+            }
+            if (old_status != StreamState::RUNNING && new_status == StreamState::RUNNING && !running_started_) {
+                running_started_         = true;
+                running_started_time_us_ = transition_time_us;
+            }
         }
         should_report_metric = old_status != StreamState::FINISHED && new_status == StreamState::FINISHED;
 
@@ -1016,19 +1028,20 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
         spec_tokens[1] = update_info.draft_token;
         propose_token_ = {target_last_token, update_info.draft_token};
     } else {
-        // Commit-only speculative steps (DSpARK prefill/decode tail) publish
-        // only accepted target tokens. Their next proposal is produced at the
-        // following decode round head and must not become persistent stream
-        // or PD side-channel state.
+        // The legacy CPU side channel has no proposal. This covers both
+        // commit-only steps and GPU-only fast paths, so GPU proposal lifetime
+        // is controlled independently by draft_token_gpu below.
         propose_token_.clear();
     }
 
     sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
     sp_output_buffer_->all_probs     = update_info.draft_token_probs;
-    // Cache the per-stream GPU propose tokens for the next decode step.
-    // PDFUSION path provides this; PD-disaggregate path leaves it undefined and
-    // readers fall back to the CPU `tokens` tensor.
-    sp_output_buffer_->propose_tokens_gpu = update_info.draft_token_gpu;
+    // Apply the explicit tri-state proposal update. PD partial updates use
+    // nullopt to preserve the handoff proposal; GPU/CPU proposal producers use
+    // a defined/undefined Tensor respectively to replace or clear the mirror.
+    if (update_info.draft_token_gpu.has_value()) {
+        sp_output_buffer_->propose_tokens_gpu = *update_info.draft_token_gpu;
+    }
 
     // for spec-decode linear attention, we need to adjust cache blocks
     if (accept_token_num > 1 && stream_cache_resource_) {
@@ -1418,10 +1431,27 @@ void GenerateStream::CopyOnWrite(const GenerateStream& other_stream, bool copy_l
 }
 
 GenerateStream::TimeInfo GenerateStream::getTimeInfo() {
-    return {begin_time_us_,
-            wait_time_us_,
-            complete_token_ids_->firstTokenTimeUs(),
-            complete_token_ids_->firstTokenLatencyUs()};
+    std::lock_guard<std::mutex> lock(*mutex_);
+    const auto                  first_token_time_us = complete_token_ids_->firstTokenTimeUs();
+
+    TimeInfo time_info;
+    time_info.begin_time_us           = begin_time_us_;
+    time_info.wait_time_us            = wait_time_us_;
+    time_info.running_started         = running_started_;
+    time_info.running_started_time_us = running_started_time_us_;
+    time_info.first_token_committed   = first_token_time_us > 0;
+    time_info.first_token_time_us     = first_token_time_us;
+    // Reuse the frozen firstTokenLatencyUs() (stamped at commit time) instead of
+    // recomputing against begin_time_us_. Decode resets begin AFTER the first
+    // token has already committed (DecodeRpcServer::update precedes
+    // resetBeginTime; BatchDecodeScheduler resets running streams), so a
+    // read-time subtraction would go negative and diverge from the frozen
+    // metrics/aux_info definition. The frozen value is non-negative by
+    // construction; clamping the subtraction to 0 would instead mask the reset.
+    time_info.first_token_rt_us       = complete_token_ids_->firstTokenLatencyUs();
+    time_info.generation_done         = generation_done_;
+    time_info.generation_done_time_us = generation_done_time_us_;
+    return time_info;
 }
 
 bool GenerateStream::queryPdSep() const {

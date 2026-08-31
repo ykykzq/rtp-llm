@@ -55,10 +55,12 @@ struct StreamSpecUpdateInfo {
     int                 draft_token;
     const torch::Tensor draft_hidden_states;
     const torch::Tensor draft_token_probs;
-    // GPU tensor of propose tokens for the next step.
-    // shape: [propose_step] (the per-stream slice). When defined, PDFUSION
-    // path will skip D2H and consume this GPU tensor directly.
-    torch::Tensor draft_token_gpu;
+    // GPU proposal update for the next step. The optional is intentionally
+    // tri-state: nullopt keeps the previous mirror, a defined tensor replaces
+    // it, and an undefined tensor explicitly clears it so readers use the
+    // current CPU draft_token instead. Per-stream tensor shape is
+    // [stream_batch, token_stride].
+    std::optional<torch::Tensor> draft_token_gpu = std::nullopt;
 
     bool                     update_remote_generate = true;
     bool                     force_update_info      = false;
@@ -89,10 +91,17 @@ public:
     }
 
 public:
+    torch::Tensor draftTokens() const {
+        if (!tokens.defined() || tokens.dim() != 2 || tokens.size(1) < 2) {
+            return torch::Tensor();
+        }
+        return tokens.narrow(1, 1, tokens.size(1) - 1);
+    }
+
     size_t        propose_step = 0;
     torch::Tensor tokens;  // selected tokens (CPU, preserved for PD-disaggregate / RPC / tests)
-    // GPU mirror of next-step propose tokens, used by PDFUSION fast paths to
-    // avoid a D2H + CPU loop + H2D round trip.
+    // GPU mirror of next-step draft tokens only (the target column is excluded),
+    // used by PDFUSION fast paths to avoid a D2H + CPU loop + H2D round trip.
     torch::Tensor propose_tokens_gpu;
     torch::Tensor hidden_states;
     torch::Tensor all_probs;
@@ -288,6 +297,10 @@ public:
             recordCanRunTime();
         }
         generate_status_->reportEvent(event, error_code, std::forward<T>(error_msg));
+        if (event == StreamEvents::GenerateDone && !generation_done_) {
+            generation_done_         = true;
+            generation_done_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds();
+        }
         if (event == StreamEvents::Error || event == StreamEvents::GenerateDone
             || event == StreamEvents::NeedRemoteGenerate) {
             consumer_cv_->notify_all();
@@ -350,10 +363,7 @@ public:
     void        reportMetric();
     std::string debugString() const;
 
-    void    resetBeginTime(int64_t begin_time_us);
-    int64_t beginTimeUs() const {
-        return begin_time_us_;
-    }
+    void resetBeginTime(int64_t begin_time_us);
 
     // for test
     void          setIsContextStream(bool is_context_stream);
@@ -748,10 +758,15 @@ public:
 
 public:
     struct TimeInfo {
-        int64_t begin_time_us;
-        int64_t wait_time_us;
-        int64_t first_token_time_us;
-        int64_t first_token_rt_us;
+        int64_t begin_time_us           = 0;
+        int64_t wait_time_us            = 0;  // legacy metric/metadata field
+        bool    running_started         = false;
+        int64_t running_started_time_us = 0;
+        bool    first_token_committed   = false;
+        int64_t first_token_time_us     = 0;
+        int64_t first_token_rt_us       = 0;
+        bool    generation_done         = false;
+        int64_t generation_done_time_us = 0;
     };
     TimeInfo getTimeInfo();
     bool     queryPdSep() const;
@@ -799,6 +814,10 @@ protected:
     int64_t                               first_running_time_us_       = 0;
     int64_t                               loading_cache_latency_us_    = 0;
     int64_t                               load_done_to_running_us_     = 0;
+    bool                                  running_started_             = false;
+    int64_t                               running_started_time_us_     = 0;
+    bool                                  generation_done_             = false;
+    int64_t                               generation_done_time_us_     = 0;
     std::shared_ptr<StreamCacheResource>  stream_cache_resource_;
     std::shared_ptr<bool>                 is_context_stream_;
     size_t                                iter_count_    = 0;
