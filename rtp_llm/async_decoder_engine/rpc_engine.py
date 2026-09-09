@@ -97,6 +97,9 @@ class LanguageCppEngine(BaseEngine):
             self.mm_process_engine.stop()
             self.mm_process_engine = None
 
+    def onflight_request_num(self) -> int:
+        return self.rtp_llm_op_.ft_op.onflight_request_num()
+
     def clear_kv_cache(self) -> None:
         """Drop reusable device-cache entries without releasing the KV pool.
 

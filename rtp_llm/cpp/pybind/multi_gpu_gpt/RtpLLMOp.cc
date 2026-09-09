@@ -76,28 +76,28 @@ prepareMTPEngineInitParams(size_t model_id, py::object propose_model, const Engi
         // it keeps the full checkpoint config instead of an MTP module plan.
         auto gpt_weight = convert.createGptWeights(py_layers_weights, py_global_weights);
         mtp_params->push_back(std::move(std::make_unique<EngineInitParams>(model_id,
-                                                                          model_config,
-                                                                          base_params.parallelism_config,
-                                                                          base_params.runtime_config,
-                                                                          base_params.pd_sep_config,
-                                                                          base_params.concurrency_config,
-                                                                          base_params.fmha_config,
-                                                                          base_params.kv_cache_config,
-                                                                          base_params.profiling_debug_logging_config,
-                                                                          base_params.hw_kernel_config,
-                                                                          base_params.device_resource_config,
-                                                                          base_params.moe_config,
-                                                                          base_params.model_specific_config,
-                                                                          base_params.sp_config,
-                                                                          base_params.cache_store_config,
-                                                                          base_params.misc_config,
-                                                                          base_params.arpc_config,
-                                                                          base_params.grpc_config,
-                                                                          base_params.ffn_disaggregate_config,
-                                                                          base_params.vit_config,
-                                                                          std::move(*gpt_weight),
-                                                                          py::none(),
-                                                                          py_eplb)));
+                                                                           model_config,
+                                                                           base_params.parallelism_config,
+                                                                           base_params.runtime_config,
+                                                                           base_params.pd_sep_config,
+                                                                           base_params.concurrency_config,
+                                                                           base_params.fmha_config,
+                                                                           base_params.kv_cache_config,
+                                                                           base_params.profiling_debug_logging_config,
+                                                                           base_params.hw_kernel_config,
+                                                                           base_params.device_resource_config,
+                                                                           base_params.moe_config,
+                                                                           base_params.model_specific_config,
+                                                                           base_params.sp_config,
+                                                                           base_params.cache_store_config,
+                                                                           base_params.misc_config,
+                                                                           base_params.arpc_config,
+                                                                           base_params.grpc_config,
+                                                                           base_params.ffn_disaggregate_config,
+                                                                           base_params.vit_config,
+                                                                           std::move(*gpt_weight),
+                                                                           py::none(),
+                                                                           py_eplb)));
         return std::move(
             std::make_unique<ProposeModelEngineInitParams>(sp_type, gen_num_per_cycle, std::move(mtp_params)));
     }
@@ -480,13 +480,19 @@ void RtpLLMOp::stop() {
     }
 }
 
+size_t RtpLLMOp::onflightRequestNum() {
+    if (!model_rpc_service_) {
+        throw std::runtime_error("onflight_request_num called before the rtp-llm service was initialized");
+    }
+    return model_rpc_service_->onflightRequestNum();
+}
+
 void RtpLLMOp::clearKVCache() {
     if (!model_rpc_service_) {
         throw std::runtime_error("clear_kv_cache called before the rtp-llm service was initialized");
     }
     if (const auto requests = model_rpc_service_->onflightRequestNum(); requests != 0) {
-        throw std::runtime_error("clear_kv_cache refused while requests are in flight: "
-                                 + std::to_string(requests));
+        throw std::runtime_error("clear_kv_cache refused while requests are in flight: " + std::to_string(requests));
     }
     const auto engine = model_rpc_service_->getEngine();
     if (!engine) {
@@ -530,6 +536,7 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("tokenizer"),
              py::arg("render"))
         .def("stop", &RtpLLMOp::stop)
+        .def("onflight_request_num", &RtpLLMOp::onflightRequestNum)
         .def("clear_kv_cache", &RtpLLMOp::clearKVCache);
 }
 

@@ -17,14 +17,15 @@ public:
     RtpLLMOp();
     ~RtpLLMOp();
 
-    void init(py::object model,
-              py::object engine_config,
-              py::object vit_config,
-              py::object propose_model,
-              py::object token_processor,
-              py::object mm_process_engine);
-    void stop();
-    void clearKVCache();
+    void   init(py::object model,
+                py::object engine_config,
+                py::object vit_config,
+                py::object propose_model,
+                py::object token_processor,
+                py::object mm_process_engine);
+    void   stop();
+    size_t onflightRequestNum();
+    void   clearKVCache();
     void
     startHttpServer(py::object model_weights_loader, py::object world_info, py::object tokenizer, py::object render);
     void pause();
