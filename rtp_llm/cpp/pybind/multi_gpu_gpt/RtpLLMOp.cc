@@ -537,6 +537,41 @@ void RtpLLMOp::clearKVCache() {
     }
 }
 
+bool RtpLLMOp::waitRemoteCacheIdle(int64_t timeout_ms) {
+    if (!model_rpc_service_) {
+        throw std::runtime_error("wait_remote_cache_idle called before the rtp-llm service was initialized");
+    }
+    const auto engine = model_rpc_service_->getEngine();
+    if (!engine) {
+        throw std::runtime_error("wait_remote_cache_idle called with a null engine");
+    }
+    const auto cache_manager = engine->getCacheManager();
+    if (!cache_manager) {
+        throw std::runtime_error("wait_remote_cache_idle called with a null cache manager");
+    }
+    pybind11::gil_scoped_release release;
+    return cache_manager->waitRemoteCacheIdle(timeout_ms);
+}
+
+void RtpLLMOp::setCacheKeySalt(int64_t salt) {
+    if (!model_rpc_service_) {
+        throw std::runtime_error("set_cache_key_salt called before the rtp-llm service was initialized");
+    }
+    if (const auto requests = model_rpc_service_->onflightRequestNum(); requests != 0) {
+        throw std::runtime_error("set_cache_key_salt refused while requests are in flight: "
+                                 + std::to_string(requests));
+    }
+    const auto engine = model_rpc_service_->getEngine();
+    if (!engine) {
+        throw std::runtime_error("set_cache_key_salt called with a null engine");
+    }
+    const auto cache_manager = engine->getCacheManager();
+    if (!cache_manager) {
+        throw std::runtime_error("set_cache_key_salt called with a null cache manager");
+    }
+    cache_manager->setCacheKeySalt(salt);
+}
+
 RtpLLMOp::~RtpLLMOp() {
     stop();
 }
@@ -571,7 +606,9 @@ void registerRtpLLMOp(const py::module& m) {
              py::arg("render"))
         .def("stop", &RtpLLMOp::stop)
         .def("onflight_request_num", &RtpLLMOp::onflightRequestNum)
-        .def("clear_kv_cache", &RtpLLMOp::clearKVCache);
+        .def("clear_kv_cache", &RtpLLMOp::clearKVCache)
+        .def("wait_remote_cache_idle", &RtpLLMOp::waitRemoteCacheIdle, py::arg("timeout_ms"))
+        .def("set_cache_key_salt", &RtpLLMOp::setCacheKeySalt, py::arg("salt"));
 }
 
 }  // namespace rtp_llm

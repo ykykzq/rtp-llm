@@ -430,6 +430,20 @@ TEST_F(StreamCacheResourceTest, testAllocateResource) {
     }
 }
 
+TEST_F(StreamCacheResourceTest, testCacheKeySaltNamespacesIdenticalTokens) {
+    prepareResource(/*reuse_cache=*/true);
+    auto& resource = stream_->streamCacheResource();
+
+    initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2, 101);
+    const auto first_namespace_keys = resource.batch_kv_cache_resource_->cacheKeys(0);
+
+    initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2, 202);
+    EXPECT_NE(resource.batch_kv_cache_resource_->cacheKeys(0), first_namespace_keys);
+
+    initCacheKeys(resource.batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), 2, 101);
+    EXPECT_EQ(resource.batch_kv_cache_resource_->cacheKeys(0), first_namespace_keys);
+}
+
 // TEST_F(StreamCacheResourceTest, testFallbackWithFastGen) {
 //     prepareResource();
 //     ASSERT_EQ(cache_manager_->freeBlocksNum(), 8);

@@ -28,6 +28,8 @@ public:
     void stop();
     size_t onflightRequestNum();
     void   clearKVCache();
+    bool   waitRemoteCacheIdle(int64_t timeout_ms);
+    void   setCacheKeySalt(int64_t salt);
     void
     startHttpServer(py::object model_weights_loader, py::object world_info, py::object tokenizer, py::object render);
     void pause();

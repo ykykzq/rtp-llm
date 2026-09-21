@@ -188,6 +188,19 @@ void StorageBackend::taskFinished() {
     }
 }
 
+bool StorageBackend::waitForIdle(int64_t timeout_ms) {
+    RTP_LLM_CHECK_WITH_INFO(storage_backend_detail::completing_backend != this,
+                            "StorageBackend waitForIdle cannot run from its callback");
+    std::unique_lock<std::mutex> lock(lifecycle_mutex_);
+    if (timeout_ms < 0) {
+        lifecycle_cv_.wait(lock, [this] { return in_flight_ == 0; });
+        return !write_failed_.load();
+    }
+    const bool idle = lifecycle_cv_.wait_for(
+        lock, std::chrono::milliseconds(timeout_ms), [this] { return in_flight_ == 0; });
+    return idle && !write_failed_.load();
+}
+
 void StorageBackend::shutdown() {
     RTP_LLM_CHECK_WITH_INFO(storage_backend_detail::completing_backend != this,
                             "StorageBackend shutdown cannot run from its callback");
@@ -309,10 +322,16 @@ bool StorageBackend::write(StorageWriteTask task) {
     RTP_LLM_CHECK(task.state_ != nullptr);
     auto state = std::move(task.state_);
     return dispatch([this, state](Lifecycle outcome) {
+        bool success = outcome == Lifecycle::ACCEPTING;
         if (outcome == Lifecycle::ACCEPTING) {
             try {
                 writeImpl(state->request);
-            } catch (...) {}
+            } catch (...) {
+                success = false;
+            }
+        }
+        if (!success) {
+            write_failed_.store(true);
         }
         state->finish();
     });

@@ -686,6 +686,42 @@ TEST(StorageBackendTest, AsyncWritesReturnBeforeCompletionAndReleaseOnlyTheirOwn
     }
 }
 
+TEST(StorageBackendTest, WaitForIdleFencesAcceptedRemoteWrites) {
+    auto pool  = std::make_shared<TestBlockPool>();
+    auto block = pool->malloc().value();
+    pool->incRef(block);
+    auto        executor = std::make_shared<HoldingExecutor>();
+    TestBackend backend(true, executor);
+    ASSERT_TRUE(initBackend(backend, pool));
+    ASSERT_TRUE(backend.write(backend.prepareWrite(makeRequest(block))));
+
+    BoundedThread<bool> wait([&backend] { return backend.waitForIdle(5000); });
+    EXPECT_EQ(wait.waitFor(std::chrono::milliseconds(50)), std::future_status::timeout);
+    ASSERT_TRUE(executor->runNext());
+    ASSERT_EQ(wait.waitFor(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(wait.get());
+
+    backend.shutdown();
+    pool->decRef(block);
+}
+
+TEST(StorageBackendTest, WaitForIdleFailsClosedAfterRemoteWriteFailure) {
+    auto pool  = std::make_shared<TestBlockPool>();
+    auto block = pool->malloc().value();
+    pool->incRef(block);
+    auto        executor = std::make_shared<HoldingExecutor>();
+    TestBackend backend(true, executor);
+    ASSERT_TRUE(initBackend(backend, pool));
+    backend.failNextWrite();
+    ASSERT_TRUE(backend.write(backend.prepareWrite(makeRequest(block))));
+    ASSERT_TRUE(executor->runNext());
+
+    EXPECT_FALSE(backend.waitForIdle(0));
+
+    backend.shutdown();
+    pool->decRef(block);
+}
+
 TEST(StorageBackendTest, AsyncWriteFailuresAndRejectionReleasePins) {
     auto pool  = std::make_shared<TestBlockPool>();
     auto block = pool->malloc().value();

@@ -125,6 +125,8 @@ public:
     // reallocating the backing pools. Refuses active, resident, or in-transfer
     // resources, including hybrid/linear-attention cache groups.
     bool        clearReusableCache();
+    bool        waitRemoteCacheIdle(int64_t timeout_ms);
+    void        setCacheKeySalt(CacheKeyType salt);
     size_t      availableTokensNum() const;
     size_t      totalBlocksNum() const;
     size_t      maxAvailableTokensNum() const;
@@ -209,8 +211,9 @@ private:
     int64_t                               cache_hit_host_tokens_   = 0;
     int64_t                               cache_hit_disk_tokens_   = 0;
 
-    std::atomic<bool> stop_{false};
-    std::thread       metrics_reporter_thread_;
+    std::atomic<bool>         stop_{false};
+    std::atomic<CacheKeyType> cache_key_salt_{0};
+    std::thread               metrics_reporter_thread_;
 
     BlockTreeCachePtr                           block_tree_cache_;
     std::shared_ptr<KVCacheAllocationWaitState> allocation_wait_state_;

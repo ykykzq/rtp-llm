@@ -328,6 +328,10 @@ bool BlockTreeCache::clearReusableCache() {
     return true;
 }
 
+bool BlockTreeCache::waitRemoteCacheIdle(int64_t timeout_ms) {
+    return config_.enable_remote_cache && storage_backend_ && storage_backend_->waitForIdle(timeout_ms);
+}
+
 BlockIndicesType BlockTreeCache::matchedBlocksForGroup(size_t                                group_id,
                                                        const std::vector<MultiNodeResource>& matched_resources) const {
     return loader_.matchedBlocksForGroup(group_id, matched_resources);

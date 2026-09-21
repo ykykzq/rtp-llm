@@ -409,13 +409,18 @@ MallocResult KVCacheManager::malloc(const MallocInfo& malloc_info) {
     // initialises the keys owns the metric.
     const bool keys_already_initialized = malloc_info.batch_kv_cache_resource->cacheKeysInitialized();
     bool       keys_initialized_now     = false;
+    const auto cache_key_salt           = cache_key_salt_.load(std::memory_order_relaxed);
     if (is_first_malloc) {
         if (!keys_already_initialized) {
-            initCacheKeys(malloc_info.batch_kv_cache_resource, malloc_info.complete_token_ids, seq_size_per_block);
+            initCacheKeys(malloc_info.batch_kv_cache_resource,
+                          malloc_info.complete_token_ids,
+                          seq_size_per_block,
+                          cache_key_salt);
             keys_initialized_now = true;
         }
     } else {
-        updateCacheKeys(malloc_info.batch_kv_cache_resource, malloc_info.complete_token_ids, seq_size_per_block);
+        updateCacheKeys(
+            malloc_info.batch_kv_cache_resource, malloc_info.complete_token_ids, seq_size_per_block, cache_key_salt);
     }
     reportPrefillCacheHitMetrics(malloc_info, keys_initialized_now);
 
@@ -662,6 +667,17 @@ bool KVCacheManager::clearReusableCache() {
         return false;
     }
     return block_tree_cache_->clearReusableCache();
+}
+
+bool KVCacheManager::waitRemoteCacheIdle(int64_t timeout_ms) {
+    if (!block_tree_cache_ || !block_tree_cache_->isRemoteCacheEnabled()) {
+        return false;
+    }
+    return block_tree_cache_->waitRemoteCacheIdle(timeout_ms);
+}
+
+void KVCacheManager::setCacheKeySalt(CacheKeyType salt) {
+    cache_key_salt_.store(salt, std::memory_order_relaxed);
 }
 
 size_t KVCacheManager::availableTokensNum() const {

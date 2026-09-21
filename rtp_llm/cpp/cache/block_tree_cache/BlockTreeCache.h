@@ -137,6 +137,9 @@ public:
     // resident nodes, or asynchronous cache transfers cause a refusal.
     bool clearReusableCache();
 
+    // Wait for asynchronous remote-tier operations without closing admission.
+    bool waitRemoteCacheIdle(int64_t timeout_ms);
+
     CacheStats                                getStats() const;
     std::vector<BlockTreePoolMetricsSnapshot> poolMetricsSnapshots() const;
     void                                      reportMetrics() const;

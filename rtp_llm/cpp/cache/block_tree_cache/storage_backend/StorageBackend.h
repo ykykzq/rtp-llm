@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -94,6 +96,9 @@ public:
     // Returns admission only, not the I/O result; never waits for completion.
     // Source pins live until execution or rejection.
     bool write(StorageWriteTask task);
+    // Waits for currently admitted operations to settle. Callers must ensure
+    // the relevant write was submitted first. Admission remains open.
+    bool waitForIdle(int64_t timeout_ms);
     // Must not be called from backend I/O or completion callbacks.
     void shutdown();
 
@@ -137,6 +142,7 @@ private:
     std::condition_variable lifecycle_cv_;
     Lifecycle               lifecycle_{Lifecycle::CREATED};
     size_t                  in_flight_{0};
+    std::atomic<bool>       write_failed_{false};
 
     friend class LoadAsyncContext;
 };
