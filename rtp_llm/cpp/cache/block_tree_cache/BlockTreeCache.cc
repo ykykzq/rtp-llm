@@ -215,6 +215,119 @@ int BlockTreeCache::evictForGroup(size_t group_id, size_t num_blocks) {
     return static_cast<int>(reclaimed);
 }
 
+bool BlockTreeCache::clearReusableCache() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_) {
+        RTP_LLM_LOG_WARNING("clearReusableCache refused: cache is not initialized");
+        return false;
+    }
+
+    const auto has_active_refs = [](const IBlockPool& pool, size_t request_refs) {
+        const size_t load_refs     = pool.referencedBlocksNum(BlockTreeRefType::LOAD);
+        const size_t eviction_refs = pool.referencedBlocksNum(BlockTreeRefType::EVICTION);
+        const size_t store_refs    = pool.referencedBlocksNum(BlockTreeRefType::STORE);
+        if (request_refs == 0 && load_refs == 0 && eviction_refs == 0 && store_refs == 0) {
+            return false;
+        }
+        RTP_LLM_LOG_WARNING(
+            "clearReusableCache refused: pool=%s request_refs=%zu load_refs=%zu eviction_refs=%zu store_refs=%zu",
+            pool.poolName().c_str(),
+            request_refs,
+            load_refs,
+            eviction_refs,
+            store_refs);
+        return true;
+    };
+
+    for (const GroupSetPtr& group_set : tree_->groupSets()) {
+        for (const DeviceBlockPoolPtr& pool : group_set->devicePools()) {
+            if (has_active_refs(*pool, pool->referencedBlocksNum())) {
+                return false;
+            }
+        }
+        if (const auto pool = group_set->hostPool(); pool && has_active_refs(*pool, 0)) {
+            return false;
+        }
+        if (const auto pool = group_set->diskPool(); pool && has_active_refs(*pool, 0)) {
+            return false;
+        }
+    }
+
+    std::vector<const TreeNode*> pending;
+    pending.reserve(tree_->size());
+    for (const auto& [_, child] : tree_->root()->children) {
+        pending.push_back(child);
+    }
+    while (!pending.empty()) {
+        const TreeNode* node = pending.back();
+        pending.pop_back();
+        if (node->is_resident) {
+            RTP_LLM_LOG_WARNING("clearReusableCache refused: resident cache key=%ld", node->cache_key);
+            return false;
+        }
+        for (const GroupSetResource& resource : node->group_set_resources) {
+            if (resource.transfer_state != GroupSetTransferState::IDLE || resource.transfer_detached) {
+                RTP_LLM_LOG_WARNING("clearReusableCache refused: cache key=%ld has an in-flight transfer",
+                                    node->cache_key);
+                return false;
+            }
+        }
+        for (const auto& [_, child] : node->children) {
+            pending.push_back(child);
+        }
+    }
+
+    const size_t initial_node_count = tree_->size();
+    for (const GroupSetPtr& group_set : tree_->groupSets()) {
+        const size_t group_set_id = group_set->groupSetId();
+        for (Tier tier : {Tier::DEVICE, Tier::HOST, Tier::DISK}) {
+            while (evictor_.dropLocked(group_set_id, tier, false)) {
+            }
+        }
+    }
+
+    // Nodes without local tier resources can remain after external cache
+    // metadata was removed. They carry no heap entries, so prune them leaf-first.
+    while (!tree_->root()->children.empty()) {
+        TreeNode* leaf = tree_->root()->children.begin()->second;
+        while (!leaf->children.empty()) {
+            leaf = leaf->children.begin()->second;
+        }
+        if (!tree_->isRemovable(leaf)) {
+            RTP_LLM_LOG_ERROR("clearReusableCache incomplete: non-removable cache key=%ld", leaf->cache_key);
+            return false;
+        }
+        tree_->removeNodeAndEmptyAncestors(leaf);
+    }
+
+    for (const GroupSetPtr& group_set : tree_->groupSets()) {
+        for (const DeviceBlockPoolPtr& pool : group_set->devicePools()) {
+            if (pool->referencedBlocksNum(BlockTreeRefType::CACHE) != 0) {
+                RTP_LLM_LOG_ERROR("clearReusableCache incomplete: pool=%s still has cache references",
+                                  pool->poolName().c_str());
+                return false;
+            }
+        }
+        if (const auto pool = group_set->hostPool();
+            pool && pool->referencedBlocksNum(BlockTreeRefType::CACHE) != 0) {
+            RTP_LLM_LOG_ERROR("clearReusableCache incomplete: pool=%s still has cache references",
+                              pool->poolName().c_str());
+            return false;
+        }
+        if (const auto pool = group_set->diskPool();
+            pool && pool->referencedBlocksNum(BlockTreeRefType::CACHE) != 0) {
+            RTP_LLM_LOG_ERROR("clearReusableCache incomplete: pool=%s still has cache references",
+                              pool->poolName().c_str());
+            return false;
+        }
+    }
+
+    if (initial_node_count != 0) {
+        onWorkflowSettledLocked(true, false);
+    }
+    return true;
+}
+
 BlockIndicesType BlockTreeCache::matchedBlocksForGroup(size_t                                group_id,
                                                        const std::vector<MultiNodeResource>& matched_resources) const {
     return loader_.matchedBlocksForGroup(group_id, matched_resources);

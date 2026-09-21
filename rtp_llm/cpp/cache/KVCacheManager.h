@@ -121,6 +121,10 @@ public:
     size_t      freeBlocksNum() const;
     size_t      availableBlocksNum() const;
     size_t      reserveBlocksNum() const;
+    // Remove reusable key mappings and release their blocks without
+    // reallocating the backing pools. Refuses active, resident, or in-transfer
+    // resources, including hybrid/linear-attention cache groups.
+    bool        clearReusableCache();
     size_t      availableTokensNum() const;
     size_t      totalBlocksNum() const;
     size_t      maxAvailableTokensNum() const;

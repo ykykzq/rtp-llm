@@ -26,6 +26,8 @@ public:
               py::object mm_process_engine,
               py::object trace_config = py::none());
     void stop();
+    size_t onflightRequestNum();
+    void   clearKVCache();
     void
     startHttpServer(py::object model_weights_loader, py::object world_info, py::object tokenizer, py::object render);
     void pause();

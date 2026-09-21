@@ -132,6 +132,11 @@ public:
     // (target_tier = NONE, content dropped). Returns the number actually freed.
     int evictForGroup(size_t group_id, size_t num_blocks);
 
+    // Remove all reusable mappings and return their blocks to the existing
+    // pools. This is an all-or-nothing preflight: active request references,
+    // resident nodes, or asynchronous cache transfers cause a refusal.
+    bool clearReusableCache();
+
     CacheStats                                getStats() const;
     std::vector<BlockTreePoolMetricsSnapshot> poolMetricsSnapshots() const;
     void                                      reportMetrics() const;

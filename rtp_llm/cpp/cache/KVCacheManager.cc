@@ -656,6 +656,14 @@ size_t KVCacheManager::reserveBlocksNum() const {
     return allocator_->reserveBlocksNum();
 }
 
+bool KVCacheManager::clearReusableCache() {
+    if (!allocator_ || !block_tree_cache_) {
+        RTP_LLM_LOG_WARNING("clearReusableCache refused: cache is not initialized");
+        return false;
+    }
+    return block_tree_cache_->clearReusableCache();
+}
+
 size_t KVCacheManager::availableTokensNum() const {
     return allocator_->availableTokensNum();
 }

@@ -228,6 +228,67 @@ protected:
     std::unique_ptr<BlockTreeCache> cache_;
 };
 
+TEST_F(BlockTreeCacheTest, ClearReusableCacheReleasesStandardAndLinearBlocksButKeepsPools) {
+    auto full_pool   = makeStructuralDevicePool(10);
+    auto linear_pool = makeStructuralDevicePool(11);
+    auto full_group =
+        std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{full_pool}, nullptr, nullptr);
+    auto linear_group =
+        std::make_shared<LinearGroupSet>(std::vector<DeviceBlockPoolPtr>{linear_pool}, nullptr, nullptr);
+    cache_ = makeBlockTreeCacheForTest({full_group, linear_group});
+
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(2));
+    resources[0][0].device_blocks = {42};
+    resources[0][1].device_blocks = {43};
+    cache_->insert({100}, resources, Tier::DEVICE);
+
+    ASSERT_EQ(cache_->getStats().tree_node_count, 1u);
+    ASSERT_EQ(full_pool->referencedBlocksNum(BlockTreeRefType::CACHE), 1u);
+    ASSERT_EQ(linear_pool->referencedBlocksNum(BlockTreeRefType::CACHE), 1u);
+    const size_t full_total_blocks   = full_pool->totalBlocksNum();
+    const size_t linear_total_blocks = linear_pool->totalBlocksNum();
+
+    EXPECT_TRUE(cache_->clearReusableCache());
+    EXPECT_EQ(cache_->getStats().tree_node_count, 0u);
+    EXPECT_EQ(full_pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+    EXPECT_EQ(linear_pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+    EXPECT_FALSE(full_pool->isAllocated(42));
+    EXPECT_FALSE(linear_pool->isAllocated(43));
+    EXPECT_EQ(full_pool->totalBlocksNum(), full_total_blocks);
+    EXPECT_EQ(linear_pool->totalBlocksNum(), linear_total_blocks);
+    EXPECT_TRUE(cache_->clearReusableCache());
+}
+
+TEST_F(BlockTreeCacheTest, ClearReusableCacheRefusesResidentEntriesWithoutMutation) {
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].device_blocks = {42};
+    ASSERT_EQ(cache_->insert({100}, resources, Tier::DEVICE, true), 1u);
+
+    const auto& pool = cache_->groupSets()[0]->devicePools()[0];
+    EXPECT_FALSE(cache_->clearReusableCache());
+    EXPECT_EQ(cache_->getStats().tree_node_count, 1u);
+    EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::CACHE), 1u);
+    EXPECT_TRUE(pool->isAllocated(42));
+}
+
+TEST_F(BlockTreeCacheTest, ClearReusableCacheRefusesRequestReferencesThenSucceedsAfterDrain) {
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].device_blocks = {42};
+    cache_->insert({100}, resources, Tier::DEVICE);
+
+    const auto& pool = cache_->groupSets()[0]->devicePools()[0];
+    pool->incRef(42);
+    EXPECT_FALSE(cache_->clearReusableCache());
+    EXPECT_EQ(cache_->getStats().tree_node_count, 1u);
+    EXPECT_EQ(pool->referencedBlocksNum(), 1u);
+    EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::CACHE), 1u);
+
+    pool->decRef(42);
+    EXPECT_TRUE(cache_->clearReusableCache());
+    EXPECT_EQ(cache_->getStats().tree_node_count, 0u);
+    EXPECT_EQ(pool->referencedBlocksNum(BlockTreeRefType::CACHE), 0u);
+}
+
 TEST_F(BlockTreeCacheTest, IncompleteResidentInsertKeepsPrefixProtectedAndRetrySucceeds) {
     std::vector<std::vector<GroupSetResource>> resources(2, std::vector<GroupSetResource>(1));
     resources[0][0].device_blocks = {42};

@@ -96,3 +96,14 @@ class LanguageCppEngine(BaseEngine):
         if self.mm_process_engine is not None:
             self.mm_process_engine.stop()
             self.mm_process_engine = None
+
+    def onflight_request_num(self) -> int:
+        return self.rtp_llm_op_.ft_op.onflight_request_num()
+
+    def clear_kv_cache(self) -> None:
+        """Drop reusable device-cache entries without releasing the KV pool.
+
+        The C++ operation rejects the transition when requests, connectors, or
+        resident cache entries still hold resources.
+        """
+        self.rtp_llm_op_.ft_op.clear_kv_cache()
