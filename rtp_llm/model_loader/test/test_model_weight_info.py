@@ -1,9 +1,12 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import List
+from unittest.mock import patch
 
 import torch
 
@@ -15,6 +18,7 @@ from rtp_llm.model_loader.model_weight_info import (
     select_output_vocab_rows,
 )
 from rtp_llm.model_loader.tensor_source import TensorCollector
+from rtp_llm.model_loader.weight_manager import WeightManager
 from rtp_llm.model_loader.weight_module import AtomicWeight
 from rtp_llm.models.base_model import BaseModel
 from rtp_llm.utils.database import CkptDatabase
@@ -55,6 +59,97 @@ class FakeCompositeWeight:
 
     def get_components(self):
         return self._weights
+
+
+class RecordingReceptor:
+    def __init__(self, output_name: str, source_names: set[str]):
+        self.output_name = output_name
+        self.source_names = source_names
+        self.loaded_sources = []
+
+    def load(self, source, layer_id, device, load_config):
+        del layer_id, device, load_config
+        values = {
+            name: source.load_tensor(name, data_type=None)[0].clone()
+            for name in self.source_names
+        }
+        self.loaded_sources.append(values)
+        return {self.output_name: torch.cat([values[name].reshape(-1) for name in sorted(values)])}
+
+
+class RecordingModelWeights:
+    def __init__(self):
+        self.global_updates = {}
+
+    def update_global_weight(self, name, data):
+        self.global_updates[name] = data
+
+
+class RecordingStream:
+    def synchronize(self):
+        pass
+
+
+def make_streaming_weight_manager(receptors):
+    manager = WeightManager.__new__(WeightManager)
+    manager._lock = threading.Lock()
+    manager._device = torch.device("cpu")
+    manager._working_stream = RecordingStream()
+    manager._weights_loader = SimpleNamespace(get_load_config=lambda: object())
+    manager._weights = RecordingModelWeights()
+    manager._non_owned_global_weights = frozenset()
+    manager._receptor_index = [
+        (frozenset(receptor.source_names), receptor, None)
+        for receptor in receptors
+    ]
+    return manager
+
+
+class WeightManagerStreamingUpdateTest(unittest.TestCase):
+    def test_shared_source_remains_buffered_until_every_receptor_consumes_it(self):
+        joint = RecordingReceptor("joint", {"shared", "other"})
+        gate = RecordingReceptor("gate", {"shared"})
+        manager = make_streaming_weight_manager([joint, gate])
+        shared = torch.tensor([1.0, 2.0])
+
+        with patch("rtp_llm.model_loader.weight_manager.torch.cuda.stream", return_value=nullcontext()):
+            manager.update_from_hf_tensors([("shared", shared)], is_last=False)
+
+            self.assertEqual(len(gate.loaded_sources), 1)
+            self.assertEqual(len(joint.loaded_sources), 0)
+            self.assertIn("shared", manager._hf_buffer)
+            self.assertNotEqual(manager._hf_buffer["shared"].data_ptr(), shared.data_ptr())
+
+            manager.update_from_hf_tensors([("other", torch.tensor([3.0]))], is_last=True)
+
+        self.assertEqual(len(joint.loaded_sources), 1)
+        self.assertEqual(set(manager._weights.global_updates), {"gate", "joint"})
+        self.assertFalse(manager._hf_round_active)
+        self.assertEqual(manager._hf_buffer, {})
+
+    def test_final_bucket_rejects_missing_source(self):
+        manager = make_streaming_weight_manager([RecordingReceptor("joint", {"left", "right"})])
+
+        with (
+            patch("rtp_llm.model_loader.weight_manager.torch.cuda.stream", return_value=nullcontext()),
+            self.assertRaisesRegex(KeyError, "missing=.*right"),
+        ):
+            manager.update_from_hf_tensors([("left", torch.tensor([1.0]))], is_last=True)
+
+        manager.abort_hf_update()
+        self.assertFalse(manager._hf_round_active)
+
+    def test_final_bucket_rejects_unexpected_source(self):
+        manager = make_streaming_weight_manager([RecordingReceptor("known", {"known"})])
+
+        with (
+            patch("rtp_llm.model_loader.weight_manager.torch.cuda.stream", return_value=nullcontext()),
+            self.assertRaisesRegex(KeyError, "unexpected=.*unknown"),
+        ):
+            manager.update_from_hf_tensors(
+                [("known", torch.tensor([1.0])), ("unknown", torch.tensor([2.0]))],
+                is_last=True,
+            )
 
 
 def make_database(files: List[FakeCkptFileInfo]) -> CkptDatabase:
