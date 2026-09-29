@@ -23,6 +23,7 @@ from rtp_llm.models_py.utils.arch import is_sm10x, is_sm90
 from rtp_llm.ops import AttentionConfigs, KvCacheDataType, ParallelismConfig, RopeStyle
 from rtp_llm.ops.compute_ops import (
     FusedRopeKVCacheDecodeOp,
+    FusedRopeKVCachePrefillOpQOut,
     LayerKVCache,
     ParamsBase,
     PyAttentionInputs,
@@ -1047,6 +1048,60 @@ class PyFlashinferPrefillImplBase(FMHAImplBase):
         Default: only query (paged layout, KV is read from the cache).
         """
         return (query,)
+
+
+class PyFlashinferMropePagedPrefillImpl(FMHAImplBase):
+    """Native paged prefill for SM10x hybrid MRoPE cache layouts."""
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        parallelism_config: Optional[ParallelismConfig] = None,
+    ) -> None:
+        self.head_num = attn_configs.head_num
+        self.head_dim = attn_configs.size_per_head
+        self.attn_inputs = attn_inputs
+        self.rope_kvcache_impl = FusedRopeKVCachePrefillOpQOut(attn_configs)
+        self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+        # TRTLLM-GEN lacks the head_dim=256, page_size=1024 context kernel.
+        self.fmha_impl = PyFlashinferPrefillPagedAttnOp(
+            attn_configs, attn_inputs, backend="fa2"
+        )
+        self.fmha_impl.prepare(attn_inputs)
+        self.write_cache_store_impl = common.create_write_cache_store_impl(attn_inputs)
+
+    @staticmethod
+    def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:
+        return (
+            is_sm10x()
+            and attn_inputs.is_prefill
+            and not attn_inputs.is_cuda_graph
+            and not attn_configs.use_mla
+            and attn_configs.need_rope_kv_cache
+            and attn_configs.rope_config.style == RopeStyle.Mrope
+            and attn_configs.size_per_head == 256
+            and attn_configs.kernel_tokens_per_block == 1024
+            and attn_configs.dtype in (torch.float16, torch.bfloat16)
+        )
+
+    def support_cuda_graph(self) -> bool:
+        return False
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        query = self.rope_kvcache_impl.forward(qkv, kv_cache, self.rope_params)
+        common.apply_write_cache_store(
+            self.write_cache_store_impl, self.attn_inputs, kv_cache
+        )
+        output = self.fmha_impl.forward(
+            query.reshape(-1, self.head_num, self.head_dim), kv_cache
+        )
+        return output.reshape(-1, self.head_num * self.head_dim)
 
 
 class PyFlashinferPagedPrefillImpl(PyFlashinferPrefillImplBase):
