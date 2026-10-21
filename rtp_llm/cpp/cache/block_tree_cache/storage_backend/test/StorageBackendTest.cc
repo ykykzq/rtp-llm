@@ -381,7 +381,7 @@ protected:
         }
         if (fail_write_) {
             fail_write_ = false;
-            throw std::runtime_error("write failed");
+            throw StorageBackendError(105, "write failed");
         }
     }
 
@@ -781,11 +781,13 @@ TEST(StorageBackendTest, WaitForIdleFencesAcceptedRemoteWrites) {
     ASSERT_TRUE(initBackend(backend, pool));
     ASSERT_TRUE(backend.write(backend.prepareWrite(makeRequest(block))));
 
+    EXPECT_EQ(backend.waitForIdleStatus(0).status, "timeout");
     BoundedThread<bool> wait([&backend] { return backend.waitForIdle(5000); });
     EXPECT_EQ(wait.waitFor(std::chrono::milliseconds(50)), std::future_status::timeout);
     ASSERT_TRUE(executor->runNext());
     ASSERT_EQ(wait.waitFor(std::chrono::seconds(5)), std::future_status::ready);
     EXPECT_TRUE(wait.get());
+    EXPECT_EQ(backend.waitForIdleStatus(0).status, "success");
 
     backend.shutdown();
     pool->decRef(block);
@@ -803,6 +805,10 @@ TEST(StorageBackendTest, WaitForIdleFailsClosedAfterRemoteWriteFailure) {
     ASSERT_TRUE(executor->runNext());
 
     EXPECT_FALSE(backend.waitForIdle(0));
+    const auto status = backend.waitForIdleStatus(0);
+    EXPECT_EQ(status.status, "write_failed");
+    EXPECT_EQ(status.error_code, 105);
+    EXPECT_FALSE(status.message.empty());
 
     backend.shutdown();
     pool->decRef(block);

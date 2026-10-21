@@ -351,6 +351,7 @@ class WeightManager:
         self._hf_pending_receptors = pending_receptors
         self._hf_round_total = 0
         self._hf_round_active = True
+        self._hf_verified_weights = 0
 
     def _reset_hf_update_round(self) -> None:
         self._hf_buffer = {}
@@ -413,6 +414,17 @@ class WeightManager:
                                 self._weights.update_layer_weight(
                                     layer_id=layer_id, name=wname, data=data
                                 )
+                            if getattr(self, "verify_hf_updates", False):
+                                installed = (
+                                    self._weights.global_weights[wname]
+                                    if layer_id is None
+                                    else self._weights.weights[layer_id][wname]
+                                )
+                                if not torch.equal(installed, data.to(installed.device)):
+                                    raise RuntimeError(
+                                        f"installed rollout weight mismatch: layer={layer_id} name={wname}"
+                                    )
+                                self._hf_verified_weights += 1
                         self._hf_pending_receptors.remove(index)
                         for src_name in needed:
                             self._hf_source_consumers[src_name] -= 1
@@ -439,9 +451,10 @@ class WeightManager:
                         f"missing={missing[:30]} unexpected={unexpected[:30]}"
                     )
                 logging.info(
-                    "completed HF weight-update round: tensors=%d receptors=%d",
+                    "completed HF weight-update round: tensors=%d receptors=%d verified_weights=%d",
                     self._hf_round_total,
                     len(self._receptor_index),
+                    self._hf_verified_weights,
                 )
                 self._reset_hf_update_round()
 

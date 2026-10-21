@@ -213,6 +213,35 @@ TEST(ClientWrapperTest, TagRoutingUsesRegistrationOrderAndFailedInitPublishesNoR
     }
 }
 
+TEST(ClientWrapperTest, SoftTransferTimeoutExitsBeforeReleasingRegisteredBuffers) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    for (bool write : {false, true}) {
+        EXPECT_EXIT(
+            ([&]() {
+                std::array<char, 16> data{};
+                kv_cache_manager::RegistSpan span{data.data(), data.size()};
+                InitObservation observation;
+                auto destroyed = std::make_shared<int>(0);
+                kv_cache_manager::MockTransferClient* transfer = nullptr;
+                auto wrapper = initializeClient(false, "direct", span, observation, destroyed,
+                                                nullptr, nullptr, &transfer);
+                kv_cache_manager::BlockBuffers buffers;
+                if (write) {
+                    EXPECT_CALL(*transfer, SaveKvCaches(_, _, _)).WillOnce(Return(
+                        std::make_pair(kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT,
+                                       kv_cache_manager::UriStrVec{})));
+                    wrapper->saveKvCachesForTag("default", {}, buffers);
+                } else {
+                    EXPECT_CALL(*transfer, LoadKvCaches(_, _, _))
+                        .WillOnce(Return(kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT));
+                    wrapper->loadKvCachesForTag("default", {}, buffers);
+                }
+            }()),
+            ::testing::ExitedWithCode(70),
+            "sdk_error_code=100.*native completion unknown");
+    }
+}
+
 TEST(ClientWrapperTest, RejectsInvalidConfigBeforeCreatingSubscriberOrClients) {
     auto                         valid      = makeConfig(false, "endpoint");
     auto                         serialized = autil::legacy::ToJsonString(valid);

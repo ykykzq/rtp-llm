@@ -195,16 +195,23 @@ void StorageBackend::taskFinished() {
 }
 
 bool StorageBackend::waitForIdle(int64_t timeout_ms) {
+    return waitForIdleStatus(timeout_ms).status == "success";
+}
+
+RemoteCacheStatus StorageBackend::waitForIdleStatus(int64_t timeout_ms) {
     RTP_LLM_CHECK_WITH_INFO(storage_backend_detail::completing_backend != this,
                             "StorageBackend waitForIdle cannot run from its callback");
     std::unique_lock<std::mutex> lock(lifecycle_mutex_);
     if (timeout_ms < 0) {
         lifecycle_cv_.wait(lock, [this] { return in_flight_ == 0; });
-        return !write_failed_.load();
+        return write_failed_.load() ? write_error_ : RemoteCacheStatus{};
     }
     const bool idle = lifecycle_cv_.wait_for(
         lock, std::chrono::milliseconds(timeout_ms), [this] { return in_flight_ == 0; });
-    return idle && !write_failed_.load();
+    if (!idle) {
+        return {"timeout", 0, "remote cache operations are still pending"};
+    }
+    return write_failed_.load() ? write_error_ : RemoteCacheStatus{};
 }
 
 void StorageBackend::shutdown() {
@@ -349,14 +356,26 @@ bool StorageBackend::write(StorageWriteTask task) {
     auto state = std::move(task.state_);
     return dispatch([this, state](Lifecycle outcome) {
         bool success = outcome == Lifecycle::ACCEPTING;
+        RemoteCacheStatus error{"write_failed", -1, "remote cache write was rejected"};
         if (outcome == Lifecycle::ACCEPTING) {
             try {
                 writeImpl(state->request);
+            } catch (const StorageBackendError& e) {
+                error = {"write_failed", e.error_code, e.what()};
+                success = false;
+            } catch (const std::exception& e) {
+                error.message = e.what();
+                success = false;
             } catch (...) {
+                error.message = "unknown native remote cache write failure";
                 success = false;
             }
         }
         if (!success) {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            if (!write_failed_.load()) {
+                write_error_ = std::move(error);
+            }
             write_failed_.store(true);
         }
         state->finish();

@@ -21,6 +21,8 @@ class Subscriber;
 
 class ClientWrapper {
 public:
+    // Read immediately on the calling thread, before another SDK operation.
+    inline static thread_local int last_error_code = -1;
     using ConfigMap = std::map<std::string, KVCMConfigPtr>;
     explicit ClientWrapper(std::unique_ptr<ClientFactory> client_factory = std::make_unique<ClientFactory>());
     virtual ~ClientWrapper();

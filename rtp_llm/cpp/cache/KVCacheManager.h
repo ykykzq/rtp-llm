@@ -122,6 +122,7 @@ public:
     // resources, including hybrid/linear-attention cache groups.
     bool        clearReusableCache();
     bool        waitRemoteCacheIdle(int64_t timeout_ms);
+    RemoteCacheStatus waitRemoteCacheStatus(int64_t timeout_ms);
     void        setCacheKeySalt(CacheKeyType salt);
     size_t      availableTokensNum() const;
     size_t      totalBlocksNum() const;

@@ -11,6 +11,7 @@
 #include "pybind11/stl.h"
 
 namespace rtp_llm {
+void registerNativeKVProbe(pybind11::module_& m);
 
 void registerEmbeddingOutput(const py::module& m) {
     py::class_<TypedOutput>(m, "TypedOutput")
@@ -40,6 +41,19 @@ void registerEmbeddingOutput(const py::module& m) {
 }
 
 PYBIND11_MODULE(libth_transformer, m) {
+    registerNativeKVProbe(m);
+    m.def("get_kvcm_build_info", []() {
+        py::dict info;
+        info["remote_kv_cache"] = KVCacheManager::remoteCacheCompiled();
+        info["sdk_version"] = RTP_KVCM_SDK_VERSION;
+        info["sdk_artifact_sha256"] = RTP_KVCM_SDK_SHA256;
+        info["sdk_source_commit"] = RTP_KVCM_SOURCE_COMMIT;
+        info["mooncake_source_commit"] = RTP_KVCM_MOONCAKE_SOURCE_COMMIT;
+        info["dependency_reference_commit"] = RTP_KVCM_DEPENDENCY_REFERENCE_COMMIT;
+        info["mooncake_master_commit"] = RTP_KVCM_MOONCAKE_MASTER_COMMIT;
+        info["compatibility_evidence"] = "upstream_pin_and_rpc_schema; GPU acceptance required";
+        return info;
+    });
     m.def("get_build_capabilities", []() {
         py::dict capabilities;
         capabilities["remote_kv_cache"] = KVCacheManager::remoteCacheCompiled();

@@ -566,6 +566,23 @@ bool RtpLLMOp::waitRemoteCacheIdle(int64_t timeout_ms) {
     return cache_manager->waitRemoteCacheIdle(timeout_ms);
 }
 
+py::dict RtpLLMOp::waitRemoteCacheStatus(int64_t timeout_ms) {
+    if (!model_rpc_service_ || !model_rpc_service_->getEngine()
+        || !model_rpc_service_->getEngine()->getCacheManager()) {
+        throw std::runtime_error("wait_remote_cache_status called before cache manager initialization");
+    }
+    RemoteCacheStatus status;
+    {
+        py::gil_scoped_release release;
+        status = model_rpc_service_->getEngine()->getCacheManager()->waitRemoteCacheStatus(timeout_ms);
+    }
+    py::dict result;
+    result["status"] = status.status;
+    result["error_code"] = status.error_code;
+    result["message"] = status.message;
+    return result;
+}
+
 void RtpLLMOp::setCacheKeySalt(int64_t salt) {
     if (!model_rpc_service_) {
         throw std::runtime_error("set_cache_key_salt called before the rtp-llm service was initialized");
@@ -621,6 +638,7 @@ void registerRtpLLMOp(const py::module& m) {
         .def("onflight_request_num", &RtpLLMOp::onflightRequestNum)
         .def("clear_kv_cache", &RtpLLMOp::clearKVCache)
         .def("wait_remote_cache_idle", &RtpLLMOp::waitRemoteCacheIdle, py::arg("timeout_ms"))
+        .def("wait_remote_cache_status", &RtpLLMOp::waitRemoteCacheStatus, py::arg("timeout_ms"))
         .def("set_cache_key_salt", &RtpLLMOp::setCacheKeySalt, py::arg("salt"));
 }
 

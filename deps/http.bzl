@@ -1,4 +1,5 @@
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
+load("//deps:kvcm_versions.bzl", "KVCM_CUDA13_X86_SHA256", "KVCM_CUDA13_ARM_SHA256")
 
 def clean_dep(dep):
     return str(Label(dep))
@@ -145,7 +146,7 @@ def http_deps():
         urls = [
             "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/kv_cache_manager/client/kv-cache-manager-client-2026_09_15_17_40-cuda130.x86_64.rpm",
         ],
-        sha256 = "392ac1aadf4ea9e3bad177a69ae8f35c5c1c59888c8505e8bee01cb8fe88d9e0",
+        sha256 = KVCM_CUDA13_X86_SHA256,
     )
 
     http_file(
@@ -153,7 +154,7 @@ def http_deps():
         urls = [
             "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/kv_cache_manager/client/kv-cache-manager-client-2026_09_15_17_39-cuda130.aarch64.rpm",
         ],
-        sha256 = "84e482dfd219df4a7a240061f43627eafb0e79d582bd67228e2d5cac7ba8ffe4",
+        sha256 = KVCM_CUDA13_ARM_SHA256,
     )
 
     http_archive(

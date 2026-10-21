@@ -648,6 +648,13 @@ bool KVCacheManager::waitRemoteCacheIdle(int64_t timeout_ms) {
     return block_tree_cache_->waitRemoteCacheIdle(timeout_ms);
 }
 
+RemoteCacheStatus KVCacheManager::waitRemoteCacheStatus(int64_t timeout_ms) {
+    if (!block_tree_cache_) {
+        return {"unavailable", -1, "block tree cache is not initialized"};
+    }
+    return block_tree_cache_->waitRemoteCacheStatus(timeout_ms);
+}
+
 void KVCacheManager::setCacheKeySalt(CacheKeyType salt) {
     cache_key_salt_.store(salt, std::memory_order_relaxed);
 }

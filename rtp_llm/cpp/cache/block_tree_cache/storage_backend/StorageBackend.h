@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +19,18 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackendExecutor.h"
 
 namespace rtp_llm {
+
+struct RemoteCacheStatus {
+    std::string status{"success"};
+    int error_code{0};
+    std::string message;
+};
+
+class StorageBackendError: public std::runtime_error {
+public:
+    StorageBackendError(int code, const std::string& message): std::runtime_error(message), error_code(code) {}
+    int error_code;
+};
 
 struct StorageBlockHandle {
     std::string  tag;
@@ -101,6 +114,7 @@ public:
     // Waits for currently admitted operations to settle. Callers must ensure
     // the relevant write was submitted first. Admission remains open.
     bool waitForIdle(int64_t timeout_ms);
+    RemoteCacheStatus waitForIdleStatus(int64_t timeout_ms);
     // Must not be called from backend I/O or completion callbacks.
     void shutdown();
 
@@ -146,6 +160,7 @@ private:
     Lifecycle               lifecycle_{Lifecycle::CREATED};
     size_t                  in_flight_{0};
     std::atomic<bool>       write_failed_{false};
+    RemoteCacheStatus      write_error_;
 
     friend class LoadAsyncContext;
 };

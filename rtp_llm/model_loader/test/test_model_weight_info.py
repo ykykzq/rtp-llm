@@ -106,6 +106,24 @@ def make_streaming_weight_manager(receptors):
 
 
 class WeightManagerStreamingUpdateTest(unittest.TestCase):
+    def test_acceptance_rejects_an_install_that_does_not_change_destination(self):
+        manager = make_streaming_weight_manager([RecordingReceptor("weight", {"weight"})])
+        manager.verify_hf_updates = True
+        manager._weights.global_weights = {"weight": torch.zeros(1)}
+        with (
+            patch("rtp_llm.model_loader.weight_manager.torch.cuda.stream", return_value=nullcontext()),
+            self.assertRaisesRegex(RuntimeError, "installed rollout weight mismatch"),
+        ):
+            manager.update_from_hf_tensors([("weight", torch.ones(1))], is_last=True)
+
+    def test_acceptance_checks_the_installed_destination(self):
+        manager = make_streaming_weight_manager([RecordingReceptor("weight", {"weight"})])
+        manager.verify_hf_updates = True
+        manager._weights.global_weights = manager._weights.global_updates
+        with patch("rtp_llm.model_loader.weight_manager.torch.cuda.stream", return_value=nullcontext()):
+            manager.update_from_hf_tensors([("weight", torch.ones(1))], is_last=True)
+        self.assertEqual(manager._hf_verified_weights, 1)
+
     def test_shared_source_remains_buffered_until_every_receptor_consumes_it(self):
         joint = RecordingReceptor("joint", {"shared", "other"})
         gate = RecordingReceptor("gate", {"shared"})

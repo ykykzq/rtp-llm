@@ -232,7 +232,9 @@ public:
         const std::string trace_id     = nextTraceId("write", write_trace_sequence_);
         auto [success, write_location] = client_wrapper_->getWriteLocation(
             "", trace_id, keys, /*tokens=*/{}, location_spec_group_names, /*write_timeout_seconds=*/600);
-        RTP_LLM_CHECK_WITH_INFO(success, "KVCM StartWrite failed");
+        if (!success) {
+            throw StorageBackendError(kvcm::ClientWrapper::last_error_code, "KVCM StartWrite failed: " + trace_id);
+        }
         if (write_location.locations.empty()) {
             return;
         }
@@ -285,13 +287,13 @@ public:
             }
             const auto& actual_locations = has_actual_uri ? write_location.locations : empty_locations;
             finish_attempted             = true;
-            RTP_LLM_CHECK_WITH_INFO(
-                client_wrapper_->finishWrite("",
+            if (!client_wrapper_->finishWrite("",
                                              nextTraceId("finish_write", finish_write_trace_sequence_),
                                              write_location.write_session_id,
                                              write_location.locations.size(),
-                                             actual_locations),
-                "KVCM FinishWrite failed");
+                                             actual_locations)) {
+                throw StorageBackendError(kvcm::ClientWrapper::last_error_code, "KVCM FinishWrite failed: " + trace_id);
+            }
         } catch (...) {
             if (!finish_attempted) {
                 try {
@@ -474,13 +476,17 @@ private:
             const auto trace_info = makeTransferTraceInfo(batch_blocks);
             if (operation == REMOTE_OPERATION_READ) {
                 if (!client_wrapper_->loadKvCachesForTag(tag, batch_uris, batch_buffers, trace_info)) {
-                    return false;
+                    response.set_sdk_error_code(kvcm::ClientWrapper::last_error_code);
+                    response.set_error_message("KVCM LoadKvCaches failed for " + tag);
+                    return true;
                 }
             } else {
                 auto [success, result] =
                     client_wrapper_->saveKvCachesForTag(tag, batch_uris, batch_buffers, trace_info);
                 if (!success || (!result.empty() && result.size() != batch_uris.size())) {
-                    return false;
+                    response.set_sdk_error_code(success ? -1 : kvcm::ClientWrapper::last_error_code);
+                    response.set_error_message("KVCM SaveKvCaches failed for " + tag);
+                    return true;
                 }
                 for (size_t index = 0; index < result.size(); ++index) {
                     actual_uris[indices[index]] = std::move(result[index]);
@@ -534,6 +540,10 @@ private:
             FunctionResponsePB response;
             RTP_LLM_CHECK_WITH_INFO(execute(requests.front().remote_request(), *response.mutable_remote_response()),
                                     "KVCM local transfer failed");
+            if (!response.remote_response().error_message().empty()) {
+                throw StorageBackendError(response.remote_response().sdk_error_code(),
+                                          response.remote_response().error_message());
+            }
             return {std::move(response)};
         }
         auto rpc_call = [](const std::shared_ptr<RpcService::Stub>&    stub,
@@ -547,6 +557,13 @@ private:
         RTP_LLM_CHECK_WITH_INFO(result != nullptr, "KVCM broadcast dispatch failed");
         result->waitDone();
         RTP_LLM_CHECK_WITH_INFO(result->success(), "KVCM broadcast transfer failed");
+        for (size_t rank = 0; rank < result->responses().size(); ++rank) {
+            const auto& response = result->responses()[rank].remote_response();
+            if (!response.error_message().empty()) {
+                throw StorageBackendError(response.sdk_error_code(),
+                                          "tp_rank=" + std::to_string(rank) + " " + response.error_message());
+            }
+        }
         return result->responses();
     }
 

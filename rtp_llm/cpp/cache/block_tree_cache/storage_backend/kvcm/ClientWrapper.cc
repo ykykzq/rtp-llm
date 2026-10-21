@@ -8,11 +8,25 @@
 #include <thread>
 #include <random>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace rtp_llm {
 namespace kvcm {
 
 namespace {
+
+void requireTerminalTransfer(kv_cache_manager::ClientErrorCode ec, const char* operation) {
+    if (ec == kv_cache_manager::ClientErrorCode::ER_SDK_TIMEOUT) {
+        // Mooncake's soft timeout cannot prove DMA completion. Unwinding would
+        // release cache block pins and allow their buffers to be reused.
+        std::fprintf(stderr,
+                     "KVCM %s sdk_error_code=100: native completion unknown; replica rank restart required\n",
+                     operation);
+        std::fflush(stderr);
+        std::_Exit(70);
+    }
+}
 
 class ReinitPolicy {
 public:
@@ -337,6 +351,7 @@ std::shared_ptr<kv_cache_manager::MetaClient> ClientWrapper::getMetaClient(const
 
 #define DEFER(...) __VA_ARGS__
 #define CHECK_INIT_BASE(unique_id, return_value)                                                                       \
+    last_error_code = -1;                                                                                              \
     std::shared_lock read_guard(rr_mutex_, std::try_to_lock);                                                          \
     if (!read_guard.owns_lock()) {                                                                                     \
         RTP_LLM_LOG_WARNING("doing re-registration");                                                                  \
@@ -394,6 +409,7 @@ bool ClientWrapper::finishWrite(const std::string&                 unique_id,
 }
 
 bool ClientWrapper::checkError(kv_cache_manager::ClientErrorCode ec) {
+    last_error_code = static_cast<int>(ec);
     if (ec == kv_cache_manager::ClientErrorCode::ER_INVALID_GRPCSTATUS) {
         grpc_error_count_.fetch_add(1, std::memory_order_acquire);
     }
@@ -488,6 +504,7 @@ bool ClientWrapper::loadKvCachesForTag(const std::string&                       
                                        const kv_cache_manager::UriStrVec&                          uri_str_vec,
                                        kv_cache_manager::BlockBuffers&                             block_buffers,
                                        const std::shared_ptr<kv_cache_manager::TransferTraceInfo>& trace_info) {
+    last_error_code = -1;
     std::shared_lock read_guard(transfer_mutex_);
     const auto       slot = tag_to_index_.find(tag);
     if (slot == tag_to_index_.end()) {
@@ -495,6 +512,8 @@ bool ClientWrapper::loadKvCachesForTag(const std::string&                       
         return false;
     }
     auto ec = transfer_clients_[slot->second]->LoadKvCaches(uri_str_vec, block_buffers, trace_info);
+    requireTerminalTransfer(ec, "LoadKvCaches");
+    last_error_code = static_cast<int>(ec);
     if (ec != kv_cache_manager::ClientErrorCode::ER_OK) {
         RTP_LLM_LOG_ERROR("kvcm client loadKvCaches fail, ec [%d]", ec);
         return false;
@@ -507,6 +526,7 @@ ClientWrapper::saveKvCachesForTag(const std::string&                            
                                   const kv_cache_manager::UriStrVec&                          uri_str_vec,
                                   const kv_cache_manager::BlockBuffers&                       block_buffers,
                                   const std::shared_ptr<kv_cache_manager::TransferTraceInfo>& trace_info) {
+    last_error_code = -1;
     std::shared_lock read_guard(transfer_mutex_);
     const auto       slot = tag_to_index_.find(tag);
     if (slot == tag_to_index_.end()) {
@@ -514,6 +534,8 @@ ClientWrapper::saveKvCachesForTag(const std::string&                            
         return {false, {}};
     }
     auto [ec, result] = transfer_clients_[slot->second]->SaveKvCaches(uri_str_vec, block_buffers, trace_info);
+    requireTerminalTransfer(ec, "SaveKvCaches");
+    last_error_code = static_cast<int>(ec);
     if (ec != kv_cache_manager::ClientErrorCode::ER_OK) {
         RTP_LLM_LOG_ERROR("kvcm client saveKvCaches fail, ec [%d]", ec);
         return {false, {}};

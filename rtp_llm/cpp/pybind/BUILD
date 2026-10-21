@@ -1,5 +1,16 @@
 load("//:def.bzl", "copts")
 load(
+    "//deps:kvcm_versions.bzl",
+    "KVCM_CUDA13_ARM_SHA256",
+    "KVCM_CUDA13_ARM_VERSION",
+    "KVCM_CUDA13_X86_SHA256",
+    "KVCM_CUDA13_X86_VERSION",
+    "KVCM_DEPENDENCY_REFERENCE_COMMIT",
+    "KVCM_MOONCAKE_MASTER_COMMIT",
+    "KVCM_MOONCAKE_SOURCE_COMMIT",
+    "KVCM_SOURCE_COMMIT",
+)
+load(
     "@arch_config//:arch_select.bzl",
     "no_block_copy_link_deps",
     "select_py_bindings",
@@ -20,7 +31,7 @@ py_test(
         "//:using_remote_kv_cache": {"EXPECT_REMOTE_KV_CACHE": "true"},
         "//conditions:default": {"EXPECT_REMOTE_KV_CACHE": "false"},
     }),
-    deps = ["//rtp_llm:ops"],
+    deps = ["//rtp_llm:ops", "//rtp_llm:device"],
 )
 
 py_test(
@@ -131,12 +142,31 @@ cc_library(
 
 cc_library(
     name = "th_transformer_lib",
+    local_defines = [
+        'RTP_KVCM_SOURCE_COMMIT="%s"' % KVCM_SOURCE_COMMIT,
+        'RTP_KVCM_MOONCAKE_SOURCE_COMMIT="%s"' % KVCM_MOONCAKE_SOURCE_COMMIT,
+        'RTP_KVCM_DEPENDENCY_REFERENCE_COMMIT="%s"' % KVCM_DEPENDENCY_REFERENCE_COMMIT,
+        'RTP_KVCM_MOONCAKE_MASTER_COMMIT="%s"' % KVCM_MOONCAKE_MASTER_COMMIT,
+    ] + select({
+        "//:using_cuda13_x86": [
+            'RTP_KVCM_SDK_VERSION="%s"' % KVCM_CUDA13_X86_VERSION,
+            'RTP_KVCM_SDK_SHA256="%s"' % KVCM_CUDA13_X86_SHA256,
+        ],
+        "//:using_cuda13_arm": [
+            'RTP_KVCM_SDK_VERSION="%s"' % KVCM_CUDA13_ARM_VERSION,
+            'RTP_KVCM_SDK_SHA256="%s"' % KVCM_CUDA13_ARM_SHA256,
+        ],
+        "//conditions:default": ['RTP_KVCM_SDK_VERSION="unknown"', 'RTP_KVCM_SDK_SHA256="unknown"'],
+    }),
     srcs = [
         "init.cc",
         "common/InitEngineOps.cc",
         "multi_gpu_gpt/RtpEmbeddingOp.cc",
         "multi_gpu_gpt/RtpLLMOp.cc",
-    ],
+    ] + select({
+        "//:using_remote_kv_cache": ["NativeKVProbe.cc"],
+        "//conditions:default": ["NativeKVProbeDisabled.cc"],
+    }),
     hdrs = [
         "common/InitEngineOps.h",
         "common/blockUtil.h",
@@ -154,7 +184,10 @@ cc_library(
         "//rtp_llm/cpp/utils:signal_utils",
         "//:rtp_compute_ops",
         "@xgrammar//:xgrammar",
-    ] + torch_deps() + select({
+    ] + select({
+        "//:using_remote_kv_cache": ["//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_client"],
+        "//conditions:default": [],
+    }) + torch_deps() + select({
         "//:using_cuda": [
             "//rtp_llm/models_py/bindings/cuda/ops:gpu_base",
             "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",

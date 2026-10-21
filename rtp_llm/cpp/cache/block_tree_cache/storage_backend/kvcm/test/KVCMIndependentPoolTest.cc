@@ -56,7 +56,7 @@ public:
                  const kv_cache_manager::BlockBuffers& buffers,
                  std::shared_ptr<kv_cache_manager::TransferTraceInfo>) override {
         if (static_cast<int>(pool_) == state_->fail_pool) {
-            return {kv_cache_manager::ClientErrorCode::ER_INVALID_PARAMS, {}};
+            return {kv_cache_manager::ClientErrorCode::ER_SDKWRITE_ERROR, {}};
         }
         auto actual = uris;
         for (size_t index = 0; index < buffers.size(); ++index) {
@@ -355,7 +355,9 @@ TEST_F(KVCMIndependentPoolTest, WorkerRoutesRepeatedTagsAcrossIndependentOrdersA
     EXPECT_EQ(response.actual_uris(3), operation.uris(3) + "_actual");
     state_->fail_pool = 1;
     RemoteOperationResponsePB failed;
-    EXPECT_FALSE(backend_->execute(operation, failed));
+    EXPECT_TRUE(backend_->execute(operation, failed));
+    EXPECT_EQ(failed.sdk_error_code(), 105);
+    EXPECT_FALSE(failed.error_message().empty());
     EXPECT_EQ(failed.actual_uris_size(), 0);
     backend_->shutdown();
     EXPECT_EQ(state_->destroyed, 3u);
