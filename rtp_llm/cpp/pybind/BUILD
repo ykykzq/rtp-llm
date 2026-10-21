@@ -9,6 +9,21 @@ load(
 package(default_visibility = ["//:__subpackages__"])
 
 py_test(
+    name = "build_capabilities_test",
+    srcs = ["build_capabilities_test.py"],
+    data = [
+        "//:rtp_compute_ops",
+        "//:th_transformer",
+        "//:th_transformer_config",
+    ],
+    env = select({
+        "//:using_remote_kv_cache": {"EXPECT_REMOTE_KV_CACHE": "true"},
+        "//conditions:default": {"EXPECT_REMOTE_KV_CACHE": "false"},
+    }),
+    deps = ["//rtp_llm:ops"],
+)
+
+py_test(
     name = "config_pickle_test",
     srcs = ["config_pickle_test.py"],
     data = [

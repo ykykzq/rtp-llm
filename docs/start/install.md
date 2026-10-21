@@ -17,6 +17,11 @@ pip install "rtp_llm>=0.2.0"
 
 
 ## Method 2: From source
+
+CUDA 13 remote prefix-cache deployments additionally require a KVCM-enabled
+native wheel. See [Building KVCM support for CUDA 13](../backend/remote_cache_build.md)
+for the opt-in configuration, installed-wheel capability check, and ARM prerequisites.
+
 | os | Python | NVIDIA GPU | AMD | Compile Tools|
 | -------| -----| ----| ----|----|
 | Linux | 3.10 | Compute Capability 7.0 or higher <br> ✅ RTX20xx<br>  ✅RTX30xx<br>  ✅RTX40xx<br>  ✅V100<br>  ✅T4<br>  ✅A10/A30/A100<br>  ✅L40/L20<br>  ✅H100/H200/H20/H800.. <br> | ✅MI308X | bazelisk |

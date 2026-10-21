@@ -33,6 +33,15 @@
 
 namespace rtp_llm {
 
+bool KVCacheManager::remoteCacheCompiled() {
+    // Keep this in the same translation unit as the gated KVCM backend.
+#ifdef RTP_LLM_USE_REMOTE_KV_CACHE
+    return true;
+#else
+    return false;
+#endif
+}
+
 class KVCacheAllocationWaitState {
 public:
     std::atomic<uint64_t>   generation{0};

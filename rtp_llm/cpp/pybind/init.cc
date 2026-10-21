@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/multimodal_processor/FeatureHashOp.h"
 #include "rtp_llm/cpp/multimodal_processor/MultimodalTypes.h"
 #include "rtp_llm/cpp/cache/Types.h"
+#include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/pybind/multi_gpu_gpt/RtpLLMOp.h"
 #include "rtp_llm/cpp/pybind/multi_gpu_gpt/RtpEmbeddingOp.h"
 #include "rtp_llm/models_py/bindings/OpDefs.h"
@@ -39,6 +40,11 @@ void registerEmbeddingOutput(const py::module& m) {
 }
 
 PYBIND11_MODULE(libth_transformer, m) {
+    m.def("get_build_capabilities", []() {
+        py::dict capabilities;
+        capabilities["remote_kv_cache"] = KVCacheManager::remoteCacheCompiled();
+        return capabilities;
+    });
     registerRtpLLMOp(m);
     registerRtpEmbeddingOp(m);
     registerEmbeddingOutput(m);

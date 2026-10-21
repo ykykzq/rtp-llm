@@ -31,6 +31,8 @@ class KVCacheAllocationWaitState;
 
 class KVCacheManager {
 public:
+    static bool remoteCacheCompiled();
+
     KVCacheManager(const CacheConfig&                 config,
                    bool                               warmup                       = false,
                    const kmonitor::MetricsReporterPtr metrics_reporter             = nullptr,

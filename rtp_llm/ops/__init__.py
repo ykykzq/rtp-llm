@@ -382,6 +382,23 @@ def ensure_engine_ops_loaded() -> None:
     _load_engine_ops(required=True)
 
 
+def get_build_capabilities() -> dict[str, bool]:
+    """Report compiled engine features without constructing an engine or model.
+
+    Unknown capabilities in an older native library are an error, not evidence
+    that the feature is available. Preserve the compute-before-engine load order.
+    """
+    ensure_engine_ops_loaded()
+    native = importlib.import_module("libth_transformer")
+    query = getattr(native, "get_build_capabilities", None)
+    if not callable(query):
+        raise RuntimeError(
+            "The loaded libth_transformer.so does not expose get_build_capabilities(); "
+            "rebuild and reinstall the native RTP-LLM wheel."
+        )
+    return query()
+
+
 def ensure_rdma_ops_loaded() -> None:
     _load_rdma_ops(required=True)
 
