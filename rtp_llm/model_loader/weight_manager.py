@@ -10,6 +10,12 @@ import torch
 
 from rtp_llm.model_loader.loader import ModelLoader
 from rtp_llm.model_loader.model_weight_info import ModelWeights
+from rtp_llm.model_loader.runtime_snapshot import (
+    RuntimeSnapshotConverter,
+    decode_runtime_key,
+    encode_runtime_key,
+    validate_runtime_tensor,
+)
 from rtp_llm.model_loader.tensor_source import TensorSource
 
 # Assuming these imports are from your project and accessible
@@ -462,6 +468,126 @@ class WeightManager:
         """Discard source tensors buffered by an incomplete streamed update."""
         with self._lock:
             self._reset_hf_update_round()
+
+    def _runtime_receptors_and_layout(self):
+        receptors = []
+        layout = {}
+        ignored_source_names = set()
+        for needed, receptor, layer_id in self._build_receptor_index():
+            if layer_id is None and receptor.name in self._non_owned_global_weights:
+                ignored_source_names.update(needed)
+                continue
+            if not needed:
+                continue
+            key = encode_runtime_key(layer_id, receptor.name)
+            resident = (
+                self._weights.global_weights
+                if layer_id is None
+                else self._weights.weights[layer_id]
+            )
+            if receptor.name not in resident:
+                raise KeyError(f"runtime receptor has no resident destination: {key!r}")
+            if key in layout:
+                raise KeyError(f"duplicate runtime receptor destination: {key!r}")
+            tensor = resident[receptor.name]
+            layout[key] = {
+                "name": key, "shape": list(tensor.shape), "dtype": str(tensor.dtype)
+            }
+            receptors.append((needed, receptor, layer_id))
+        required_names = {name for needed, _, _ in receptors for name in needed}
+        return (
+            receptors,
+            [layout[key] for key in sorted(layout)],
+            ignored_source_names - required_names,
+        )
+
+    def get_runtime_weight_layout(self) -> list[dict]:
+        """Return metadata for updateable local shards, excluding non-owning aliases."""
+        with self._lock:
+            return self._runtime_receptors_and_layout()[1]
+
+    def create_runtime_snapshot_converter(self, max_pending_bytes: int):
+        """Create an independent, non-mutating conversion round at this TP rank."""
+        with self._lock:
+            receptors, layout, ignored_source_names = self._runtime_receptors_and_layout()
+            return RuntimeSnapshotConverter(
+                receptor_index=receptors,
+                load_config=self._weights_loader.get_load_config(),
+                runtime_layout=layout,
+                tensor_source_factory=_DictTensorSource,
+                device=self._device,
+                max_pending_bytes=max_pending_bytes,
+                ignored_source_names=ignored_source_names,
+            )
+
+    def update_from_runtime_tensors(self, named_tensors, is_last: bool = False) -> None:
+        """Install local runtime shards directly, with no receptor transformations.
+
+        The caller must pause inference until the complete round succeeds. A failed
+        round remains failed until ``abort_runtime_update``; abort clears tracking
+        only and does not roll back destinations already copied by earlier batches.
+        """
+        with self._lock:
+            if getattr(self, "_runtime_round_failed", False):
+                raise RuntimeError("runtime update failed; call abort_runtime_update before retrying")
+            if not getattr(self, "_runtime_round_active", False):
+                self._runtime_expected = {
+                    entry["name"]: entry for entry in self._runtime_receptors_and_layout()[1]
+                }
+                self._runtime_seen = set()
+                self._runtime_verified_weights = 0
+                self._runtime_round_active = True
+            try:
+                incoming = list(named_tensors)
+                batch_names = set()
+                for key, tensor in incoming:
+                    decode_runtime_key(key)
+                    if key in self._runtime_seen or key in batch_names:
+                        raise KeyError(f"duplicate runtime update tensor {key!r}")
+                    if key not in self._runtime_expected:
+                        raise KeyError(f"unexpected runtime update tensor {key!r}")
+                    validate_runtime_tensor(key, tensor, self._runtime_expected[key], self._device)
+                    batch_names.add(key)
+                if is_last:
+                    missing = self._runtime_expected.keys() - self._runtime_seen - batch_names
+                    if missing:
+                        raise KeyError(f"incomplete runtime weight-update round: missing={sorted(missing)[:30]}")
+
+                if self._device.type == "cuda":
+                    self._working_stream.wait_stream(torch.cuda.current_stream(self._device))
+                try:
+                    with torch.cuda.stream(self._working_stream):
+                        for key, tensor in incoming:
+                            layer_id, name = decode_runtime_key(key)
+                            if layer_id is None:
+                                self._weights.update_global_weight(name=name, data=tensor)
+                                installed = self._weights.global_weights[name]
+                            else:
+                                self._weights.update_layer_weight(layer_id=layer_id, name=name, data=tensor)
+                                installed = self._weights.weights[layer_id][name]
+                            if getattr(self, "verify_hf_updates", False):
+                                if not torch.equal(installed, tensor):
+                                    raise RuntimeError(f"installed runtime weight mismatch: {key}")
+                                self._runtime_verified_weights += 1
+                            self._runtime_seen.add(key)
+                finally:
+                    self._working_stream.synchronize()
+                if is_last:
+                    self._runtime_expected.clear()
+                    self._runtime_seen.clear()
+                    self._runtime_round_active = False
+            except Exception:
+                self._runtime_round_failed = True
+                raise
+
+    def abort_runtime_update(self) -> None:
+        """Clear only this runtime install round; inference stays paused by the caller."""
+        with self._lock:
+            self._working_stream.synchronize()
+            self._runtime_expected = {}
+            self._runtime_seen = set()
+            self._runtime_round_active = False
+            self._runtime_round_failed = False
 
 
 class _DictTensorSource(TensorSource):

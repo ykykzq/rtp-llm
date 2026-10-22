@@ -1,6 +1,6 @@
 load("//:def.bzl", "copts")
 load(
-    "//deps:kvcm_versions.bzl",
+    "@rtp_deps//:kvcm_versions.bzl",
     "KVCM_CUDA13_ARM_SHA256",
     "KVCM_CUDA13_ARM_VERSION",
     "KVCM_CUDA13_X86_SHA256",
@@ -143,20 +143,20 @@ cc_library(
 cc_library(
     name = "th_transformer_lib",
     local_defines = [
-        'RTP_KVCM_SOURCE_COMMIT="%s"' % KVCM_SOURCE_COMMIT,
-        'RTP_KVCM_MOONCAKE_SOURCE_COMMIT="%s"' % KVCM_MOONCAKE_SOURCE_COMMIT,
-        'RTP_KVCM_DEPENDENCY_REFERENCE_COMMIT="%s"' % KVCM_DEPENDENCY_REFERENCE_COMMIT,
-        'RTP_KVCM_MOONCAKE_MASTER_COMMIT="%s"' % KVCM_MOONCAKE_MASTER_COMMIT,
+        'RTP_KVCM_SOURCE_COMMIT=\\"%s\\"' % KVCM_SOURCE_COMMIT,
+        'RTP_KVCM_MOONCAKE_SOURCE_COMMIT=\\"%s\\"' % KVCM_MOONCAKE_SOURCE_COMMIT,
+        'RTP_KVCM_DEPENDENCY_REFERENCE_COMMIT=\\"%s\\"' % KVCM_DEPENDENCY_REFERENCE_COMMIT,
+        'RTP_KVCM_MOONCAKE_MASTER_COMMIT=\\"%s\\"' % KVCM_MOONCAKE_MASTER_COMMIT,
     ] + select({
         "//:using_cuda13_x86": [
-            'RTP_KVCM_SDK_VERSION="%s"' % KVCM_CUDA13_X86_VERSION,
-            'RTP_KVCM_SDK_SHA256="%s"' % KVCM_CUDA13_X86_SHA256,
+            'RTP_KVCM_SDK_VERSION=\\"%s\\"' % KVCM_CUDA13_X86_VERSION,
+            'RTP_KVCM_SDK_SHA256=\\"%s\\"' % KVCM_CUDA13_X86_SHA256,
         ],
         "//:using_cuda13_arm": [
-            'RTP_KVCM_SDK_VERSION="%s"' % KVCM_CUDA13_ARM_VERSION,
-            'RTP_KVCM_SDK_SHA256="%s"' % KVCM_CUDA13_ARM_SHA256,
+            'RTP_KVCM_SDK_VERSION=\\"%s\\"' % KVCM_CUDA13_ARM_VERSION,
+            'RTP_KVCM_SDK_SHA256=\\"%s\\"' % KVCM_CUDA13_ARM_SHA256,
         ],
-        "//conditions:default": ['RTP_KVCM_SDK_VERSION="unknown"', 'RTP_KVCM_SDK_SHA256="unknown"'],
+        "//conditions:default": ['RTP_KVCM_SDK_VERSION=\\"unknown\\"', 'RTP_KVCM_SDK_SHA256=\\"unknown\\"'],
     }),
     srcs = [
         "init.cc",

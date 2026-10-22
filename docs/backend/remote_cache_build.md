@@ -98,6 +98,63 @@ These are the public KVCM admin protobuf names; specifically the admin field is
 single compatible NIC first; an empty device selection requires working
 multi-NIC connectivity. This configuration does not route KV through OSS.
 
+### Service Health Before Model Loading
+
+The Mooncake RPC port and HTTP metrics port are separate. In the 2026-10-22
+handoff the master RPC endpoint is `10.64.186.151:50151`, its metrics listener
+is `9004`, and the KVCM metadata endpoint uses port `6381`. The vendor
+`client_c.cc` reads `MASTER_METRICS` when creating its client and defaults to
+`9003`. Using that default with this deployment caused `get store status
+failed[-900]`, `all storages are unavailable`, and probe SDK error `51`.
+
+Set the same `MASTER_METRICS` for the **KVCM service process and every rollout
+worker/probe process**, before starting them. Setting it only in the training
+driver does not change an already running KVCM service or Ray worker:
+
+```bash
+export MASTER_METRICS=9004
+export KVCM_MOONCAKE_MASTER=10.64.186.151:50151
+python -m rtp_llm.utils.kvcm_probe --service-only \
+  --address 10.64.186.151:6381 --instance-group l20c_rl_pinned_20261021 \
+  --min-free-bytes 67108864
+```
+
+Use addresses for the actual deployment. The CPU-only check sends HTTP GET to
+`http://<master-host>:<MASTER_METRICS>/health` and `/metrics`, matching the
+vendor client. It requires HTTP 200 on both and the unlabelled uint64 gauges
+`master_allocated_bytes` and `master_total_capacity_bytes`. It rejects missing
+or ambiguous gauges, zero capacity, allocation above capacity, and less than
+the requested free bytes. JSON, TCP reachability, and the metadata service's
+health are not substitutes for this contract. HA master discovery is not
+implemented by this helper; it rejects an unresolved HA URI.
+
+The JSON result records both HTTP statuses, allocated/total/free bytes, the
+requested minimum, and the checked endpoints. Failures expose the same
+available evidence through `ServicePreflightError.diagnostics`. This is a
+point-in-time check of master memory capacity, not a reservation or proof of
+the instance group's quota, RDMA connectivity, or cross-replica restoration.
+Run the native GPU probe and strict migration acceptance as well.
+
+`--storage-config /path/to/storage.json` (or `KVCM_STORAGE_CONFIG`) can read
+the deployed KVCM admin storage document shown above. It also accepts a bare
+storage object and the internal Mooncake key `master_server_entry`.
+If a master is supplied both ways, they must agree. This file must reflect
+the actual server's selected storage candidate; the helper does not discover
+or reconfigure the KVCM server. `--master-metrics-port` must agree with
+`MASTER_METRICS` when the latter is set, and is forwarded to the native child.
+The historical default `9003` remains unchanged for existing deployments.
+
+The Python `run_probe(address, instance_group, sdk_config, ...)` API reads
+these environment variables and performs the HTTP check before its GPU
+subprocess. It also accepts `mooncake_master`, `storage_config`,
+`master_metrics_port`, `min_free_bytes` (defaults to the probe size), and
+`service_timeout_s` as optional keyword arguments. Existing callers without
+a configured master continue to run the native probe and report HTTP service
+health as `not_checked`. Acceptance launchers should require an explicit
+master or storage configuration. VERL's startup call must remain before
+`BackendManager.start()` and must propagate `MASTER_METRICS` alongside its
+existing `KVCM_*` variables to every worker.
+
 ```bash
 python -m rtp_llm.utils.kvcm_probe \
   --address kvcm-host:rpc-port --instance-group mooncake-probes
@@ -112,12 +169,22 @@ write, commit and read; the second keeps the producer alive while another GPU
 node reads, repeats 64 KiB/64 MiB transfers and checks every byte. There is no
 Python Mooncake storage client substitute. SDK codes, including write error
 105 from incompatible FUSE allocation, propagate rather than being ignored.
+Native errors include the probe operation, metadata address, instance group,
+instance ID and metrics port, without dumping raw SDK/storage configuration.
+The isolated Python wrapper adds the observed service-health report. SDK
+error `51` prompts inspection of the configured master's health and capacity;
+it does not by itself identify a KV algorithm defect.
 Startup preflight runs in a child process. During actual engine KV transfers,
 SDK `ER_SDK_TIMEOUT=100` exits the affected rank with code 70 before releasing
 block pins; the replica must be restarted. The SDK's documented Mooncake
 soft timeout does not prove DMA completion, so falling back while reusing those
 buffers is unsafe. A cache-flush wait deadline (writes still in flight) remains
 a normal structured `timeout` and does not itself terminate a rank.
+The native probe follows the same exit-70 policy for SDK soft timeouts and
+exceptions that interrupt a transfer before completion is confirmed. It does
+not abort the write allocation or unwind its registered tensor first. Its
+Python CLI also covers construction and cleanup exceptions with process exit;
+call `run_probe()` from application code to preserve that isolation.
 Use a test instance group configured with the same storage policy as rollout.
 Direct two-terminal testing is also available with `--phase put` and
 `--phase get --ticket '<producer JSON>'`; keep the producer at its prompt until
@@ -138,6 +205,12 @@ Use the repository's CUDA 13.2 / Python 3.10 build environment with the matching
 PyTorch ABI, Bazelisk, `rpm2cpio`, `cpio`, and `patchelf`. The builder must be able
 to fetch the pinned repositories in `deps/http.bzl`. This recipe has not been
 validated by a native CUDA build on the macOS development host.
+
+Both dependency loads use `@rtp_deps//:kvcm_versions.bzl`. The native build-info
+defines retain escaped string quotes through the CUDA wrapper, including the
+`unknown` fallbacks. These are the two-file fixes from the handoff's successful
+installed-wheel build; local source/patch checks do not replace rebuilding and
+checking `get_kvcm_build_info()` on Linux.
 
 ```bash
 bazelisk build //rtp_llm:rtp_llm --config=cuda13_remote_cache --verbose_failures

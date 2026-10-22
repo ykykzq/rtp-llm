@@ -1,5 +1,5 @@
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
-load("//deps:kvcm_versions.bzl", "KVCM_CUDA13_X86_SHA256", "KVCM_CUDA13_ARM_SHA256")
+load("@rtp_deps//:kvcm_versions.bzl", "KVCM_CUDA13_X86_SHA256", "KVCM_CUDA13_ARM_SHA256")
 
 def clean_dep(dep):
     return str(Label(dep))

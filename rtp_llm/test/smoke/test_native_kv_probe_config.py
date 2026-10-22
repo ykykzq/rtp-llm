@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import unittest
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -7,13 +9,82 @@ from rtp_llm.utils.kvcm_probe import probe_config, run_probe
 
 
 class NativeKVProbeConfigTest(unittest.TestCase):
-    def test_preflight_preserves_native_failure_and_exit_code(self):
-        with patch(
-            "rtp_llm.utils.kvcm_probe.subprocess.run",
-            return_value=CompletedProcess([], 1, "", "sdk_error_code=105"),
+    def test_native_failures_include_probe_context_and_actual_service_health(self):
+        with (
+            patch(
+                "rtp_llm.utils.kvcm_probe.subprocess.run",
+                return_value=CompletedProcess(
+                    [], 1, "", "StartWrite sdk_error_code=51"
+                ),
+            ),
+            self.assertRaises(RuntimeError) as error,
         ):
-            with self.assertRaisesRegex(RuntimeError, "exited 1.*sdk_error_code=105"):
-                run_probe("kvcm:6380", "gpu-probes", '[{"type":"mooncake"}]')
+            run_probe("kvcm:6381", "rollout-group", '[{"type":"mooncake"}]')
+        for expected in (
+            "kvcm:6381",
+            "rollout-group",
+            "instance_id",
+            "service_health",
+            "not_checked",
+            "sdk_error_code=51",
+        ):
+            self.assertIn(expected, str(error.exception))
+
+    def test_constructor_and_cleanup_failures_terminate_without_unwinding_buffers(self):
+        # Only CUDA/native imports are replaced: the real probe control flow
+        # runs in a child, so normal Python unwinding is observable as exit 8.
+        source = """
+import sys, types
+from rtp_llm.utils.kvcm_probe import _run_probe
+class Buffer:
+    def to(self, **kwargs): return self
+class Generator:
+    def manual_seed(self, seed): return self
+class Probe:
+    def __init__(self, *args):
+        if sys.argv[1] == "construct": raise RuntimeError("sdk_error_code=51")
+    def put(self, key):
+        if sys.argv[1] == "put": raise RuntimeError("sdk_error_code=51")
+        return "mooncake://probe"
+    def close(self): raise RuntimeError("close failure")
+sys.modules["torch"] = types.SimpleNamespace(
+    cuda=types.SimpleNamespace(set_device=lambda d: None, synchronize=lambda d: None),
+    randint=lambda *args, **kwargs: Buffer(), uint8="uint8", Generator=Generator)
+sys.modules["rtp_llm.ops"] = types.SimpleNamespace(ensure_engine_ops_loaded=lambda: None)
+sys.modules["libth_transformer"] = types.SimpleNamespace(NativeKVProbe=Probe, get_kvcm_build_info=lambda: {})
+try:
+    _run_probe("kvcm:6381", "rollout-group", '[{"type":"mooncake"}]', phase="put")
+except BaseException:
+    print("unsafe normal unwind", flush=True)
+    sys.exit(8)
+"""
+        for operation in ("construct", "put", "close"):
+            with self.subTest(operation=operation):
+                result = subprocess.run(
+                    [sys.executable, "-c", source, operation],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("unsafe normal unwind", result.stdout)
+                for expected in (
+                    "kvcm:6381",
+                    "rollout-group",
+                    "instance_id",
+                    "operation",
+                ):
+                    self.assertIn(expected, result.stderr)
+
+    def test_preflight_preserves_native_failure_and_exit_code(self):
+        with (
+            patch(
+                "rtp_llm.utils.kvcm_probe.subprocess.run",
+                return_value=CompletedProcess([], 1, "", "sdk_error_code=105"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "exited 1.*sdk_error_code=105"),
+        ):
+            run_probe("kvcm:6380", "gpu-probes", '[{"type":"mooncake"}]')
 
     def test_preflight_requires_byte_equality_evidence_from_child(self):
         for stdout in (
