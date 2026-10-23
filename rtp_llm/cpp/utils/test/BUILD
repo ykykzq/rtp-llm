@@ -10,6 +10,13 @@ google_test_deps = [
     "@com_google_googletest//:gtest_main",
 ]
 
+cc_test(
+    name = "hash_util_test",
+    srcs = ["HashUtilTest.cc"],
+    copts = ["-std=c++17"],
+    deps = ["//rtp_llm/cpp/utils:hash_util"],
+)
+
 test_deps = [
     "//rtp_llm/cpp/utils:core_utils",
     "//rtp_llm/cpp/utils:kv_cache_utils",
