@@ -340,6 +340,13 @@ RemoteCacheStatus BlockTreeCache::waitRemoteCacheStatus(int64_t timeout_ms) {
     return storage_backend_->waitForIdleStatus(timeout_ms);
 }
 
+RemoteCacheStatus BlockTreeCache::waitRemotePrefixStatus(const CacheKeysType& keys, int64_t timeout_ms) {
+    if (!config_.enable_remote_cache || !storage_backend_) {
+        return {"unavailable", -1, "remote cache backend is not enabled"};
+    }
+    return storage_backend_->waitForPrefix(keys, timeout_ms);
+}
+
 BlockIndicesType BlockTreeCache::matchedBlocksForGroup(std::string_view                      group_tag,
                                                        const std::vector<MultiNodeResource>& matched_resources) const {
     return loader_.matchedBlocksForGroup(group_tag, matched_resources);

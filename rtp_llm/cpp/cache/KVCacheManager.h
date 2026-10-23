@@ -123,6 +123,7 @@ public:
     bool        clearReusableCache();
     bool        waitRemoteCacheIdle(int64_t timeout_ms);
     RemoteCacheStatus waitRemoteCacheStatus(int64_t timeout_ms);
+    RemoteCacheStatus waitRemotePrefixStatus(const std::vector<int32_t>& tokens, CacheKeyType salt, int64_t timeout_ms);
     void        setCacheKeySalt(CacheKeyType salt);
     size_t      availableTokensNum() const;
     size_t      totalBlocksNum() const;

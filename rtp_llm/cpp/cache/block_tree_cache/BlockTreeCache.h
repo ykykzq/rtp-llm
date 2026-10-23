@@ -141,6 +141,7 @@ public:
     // Wait for asynchronous remote-tier operations without closing admission.
     bool waitRemoteCacheIdle(int64_t timeout_ms);
     RemoteCacheStatus waitRemoteCacheStatus(int64_t timeout_ms);
+    RemoteCacheStatus waitRemotePrefixStatus(const CacheKeysType& keys, int64_t timeout_ms);
 
     CacheStats                                getStats() const;
     std::vector<BlockTreePoolMetricsSnapshot> poolMetricsSnapshots() const;

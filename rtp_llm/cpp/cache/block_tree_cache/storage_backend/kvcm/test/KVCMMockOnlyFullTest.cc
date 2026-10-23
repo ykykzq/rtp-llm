@@ -179,6 +179,7 @@ TEST(KVCMMockOnlyFullTest, TP2CoordinatorBroadcastsRankOrderedReadAndWritePayloa
     backend->write(backend->prepareWrite(makeStorageRequest(environment)));
     ASSERT_TRUE(waitForBackendOperationsForTest(*backend.backend));
 
+    EXPECT_EQ(backend->waitForPrefix({101}, 0).status, "success");
     for (size_t rank = 0; rank < states.size(); ++rank) {
         const auto requests = snapshotRequests(states[rank]);
         ASSERT_EQ(requests.size(), 2u);
@@ -254,6 +255,10 @@ TEST(KVCMMockOnlyFullTest, TP2BroadcastFailureAbortsWriteSession) {
     ASSERT_TRUE(waitForBackendOperationsForTest(*backend.backend));
     EXPECT_EQ(environment.device_pool->refCount(environment.block_id), source_ref_count);
     EXPECT_EQ(environment.device_pool->referencedBlocksNum(BlockTreeRefType::STORE), 0u);
+    const auto prefix_status = backend->waitForPrefix({101}, 0);
+    EXPECT_EQ(prefix_status.status, "write_failed");
+    EXPECT_FALSE(prefix_status.write_ids.empty());
+    EXPECT_EQ(backend->waitForPrefix({101}, 0).status, "write_failed");
     for (const auto& state : states) {
         const auto requests = snapshotRequests(state);
         ASSERT_EQ(requests.size(), 1u);
@@ -692,6 +697,7 @@ TEST(KVCMMockOnlyFullTest, FinishWriteFailureIsNotRetried) {
         }));
     backend->write(backend->prepareWrite(makeStorageRequest(environment)));
     ASSERT_TRUE(waitForBackendOperationsForTest(*backend.backend));
+    EXPECT_EQ(backend->waitForPrefix({101}, 0).status, "write_failed");
 }
 
 }  // namespace

@@ -114,5 +114,8 @@ class LanguageCppEngine(BaseEngine):
     def wait_remote_cache_status(self, timeout_ms: int) -> dict:
         return self.rtp_llm_op_.ft_op.wait_remote_cache_status(timeout_ms)
 
+    def wait_remote_prefix_status(self, tokens: list[int], salt: int, timeout_ms: int) -> dict:
+        return self.rtp_llm_op_.ft_op.wait_remote_prefix_status(tokens, salt, timeout_ms)
+
     def set_cache_key_salt(self, salt: int) -> None:
         self.rtp_llm_op_.ft_op.set_cache_key_salt(salt)

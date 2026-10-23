@@ -1,6 +1,12 @@
 load("//:def.bzl", "copts")
 load("//bazel:arch_select.bzl", "no_block_copy_link_deps", "torch_deps")
 
+cc_library(
+    name = "remote_write_ledger",
+    hdrs = ["storage_backend/RemoteWriteLedger.h"],
+    visibility = ["//visibility:public"],
+)
+
 # Leaf pool target: DeviceBlockPool owns its backing and inherits the common
 # IBlockPool lifecycle. Keeping this target below allocator/group targets avoids
 # a cycle with the full block_tree_cache library.
@@ -135,6 +141,7 @@ cc_library(
         "//rtp_llm/cpp/cache/events:kv_cache_event",
         ":block_tree_task_pool",
         ":device_block_pool",
+        ":remote_write_ledger",
         "//rtp_llm/cpp/cache:batch_kv_cache_resource",
         "//rtp_llm/cpp/cache:cache_group_type",
         "//rtp_llm/cpp/cache:cache_types",

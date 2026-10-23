@@ -602,6 +602,25 @@ void RtpLLMOp::setCacheKeySalt(int64_t salt) {
     cache_manager->setCacheKeySalt(salt);
 }
 
+py::dict RtpLLMOp::waitRemotePrefixStatus(const std::vector<int32_t>& tokens, int64_t salt, int64_t timeout_ms) {
+    if (!model_rpc_service_ || !model_rpc_service_->getEngine()
+        || !model_rpc_service_->getEngine()->getCacheManager()) {
+        throw std::runtime_error("wait_remote_prefix_status called before cache manager initialization");
+    }
+    RemoteCacheStatus status;
+    {
+        py::gil_scoped_release release;
+        status = model_rpc_service_->getEngine()->getCacheManager()->waitRemotePrefixStatus(tokens, salt, timeout_ms);
+    }
+    py::dict result;
+    result["status"] = status.status;
+    result["error_code"] = status.error_code;
+    result["message"] = status.message;
+    result["write_ids"] = status.write_ids;
+    result["prefix_tokens"] = status.prefix_tokens;
+    return result;
+}
+
 RtpLLMOp::~RtpLLMOp() {
     stop();
 }
@@ -639,6 +658,8 @@ void registerRtpLLMOp(const py::module& m) {
         .def("clear_kv_cache", &RtpLLMOp::clearKVCache)
         .def("wait_remote_cache_idle", &RtpLLMOp::waitRemoteCacheIdle, py::arg("timeout_ms"))
         .def("wait_remote_cache_status", &RtpLLMOp::waitRemoteCacheStatus, py::arg("timeout_ms"))
+        .def("wait_remote_prefix_status", &RtpLLMOp::waitRemotePrefixStatus,
+             py::arg("tokens"), py::arg("salt"), py::arg("timeout_ms"))
         .def("set_cache_key_salt", &RtpLLMOp::setCacheKeySalt, py::arg("salt"));
 }
 

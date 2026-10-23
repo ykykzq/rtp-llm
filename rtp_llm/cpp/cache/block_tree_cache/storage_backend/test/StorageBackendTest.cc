@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <deque>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -838,6 +839,97 @@ TEST(StorageBackendTest, AsyncWriteFailuresAndRejectionReleasePins) {
     EXPECT_FALSE(backend.write(backend.prepareWrite(makeRequest(block))));
     EXPECT_EQ(pool->refCount(block), 1u);
     pool->decRef(block);
+}
+
+TEST(StorageBackendTest, PrefixWritesRecoverIndependentlyWithoutDrainingOtherOperations) {
+    auto pool = std::make_shared<TestBlockPool>();
+    auto block = pool->malloc().value();
+    pool->incRef(block);
+    auto executor = std::make_shared<HoldingExecutor>();
+    TestBackend backend(true, executor);
+    ASSERT_TRUE(initBackend(backend, pool));
+    auto submit = [&](CacheKeyType key) {
+        auto request = makeRequest(block);
+        request.keys = std::make_shared<const CacheKeysType>(CacheKeysType{key});
+        return backend.write(backend.prepareWrite(std::move(request)));
+    };
+    backend.failNextWrite();
+    ASSERT_TRUE(submit(1));
+    ASSERT_TRUE(executor->runNext());
+    EXPECT_EQ(backend.waitForPrefix({1}, 0).error_code, 105);
+    ASSERT_TRUE(submit(2));
+    ASSERT_TRUE(submit(3));  // An unrelated write must not delay prefix 2.
+    EXPECT_EQ(backend.waitForPrefix({2}, 0).status, "timeout");
+    EXPECT_EQ(pool->refCount(block), 3u);  // Timeout does not release either write's pin.
+    ASSERT_TRUE(executor->runNext());
+    EXPECT_EQ(backend.waitForPrefix({2}, 0).status, "success");
+    EXPECT_EQ(backend.waitForPrefix({1, 2}, 0).error_code, 105);
+    EXPECT_EQ(backend.waitForPrefix({1}, 0).error_code, 105);
+    EXPECT_EQ(backend.waitForIdleStatus(0).status, "timeout");
+    ASSERT_TRUE(submit(1));
+    ASSERT_TRUE(executor->runLast());
+    EXPECT_EQ(backend.waitForPrefix({1, 2}, 0).status, "success");
+    backend.shutdown();
+    EXPECT_EQ(backend.waitForIdleStatus(0).error_code, 105);  // Legacy diagnostic is unchanged.
+    EXPECT_FALSE(submit(4));
+    EXPECT_EQ(backend.waitForPrefix({4}, 0).status, "write_failed");
+    EXPECT_EQ(pool->refCount(block), 1u);
+    pool->decRef(block);
+}
+
+TEST(StorageBackendTest, PrefixWaitRequiresFullLinearAndSwaDependencies) {
+    std::vector<GroupBase> groups;
+    StorageBackend::PoolsByTag pools;
+    std::map<std::string, BlockIdxType> blocks;
+    for (const auto& [tag, type] : std::vector<std::pair<std::string, CacheGroupType>>{
+             {"full", CacheGroupType::FULL}, {"linear", CacheGroupType::LINEAR}, {"swa", CacheGroupType::SWA}}) {
+        GroupBase group;
+        group.tag = tag;
+        group.spec = std::make_shared<MHAKVCacheSpec>(tag, 1, 1, 1);
+        group.policy = defaultCacheGroupPolicy(type);
+        if (type == CacheGroupType::SWA) {
+            group.policy.sliding_window_size = 2;
+        }
+        groups.push_back(group);
+        auto pool = std::make_shared<TestBlockPool>();
+        auto block = pool->malloc().value();
+        pool->incRef(block);
+        pools.emplace(tag, pool);
+        blocks.emplace(tag, block);
+    }
+    auto executor = std::make_shared<HoldingExecutor>();
+    TestBackend backend(true, executor);
+    ASSERT_TRUE(backend.init(CacheTopology::create(groups, {{0, {"full", "linear", "swa"}}}), pools,
+                             [](int, const std::string&, int) {
+                                 return std::vector<BlockInfo>{{false, 0, 0, reinterpret_cast<void*>(1), 16}};
+                             }));
+    auto write = [&](CacheKeysType keys, const std::string& tag) {
+        StorageRequest request;
+        request.keys = std::make_shared<const CacheKeysType>(keys);
+        request.handles.resize(keys.size(), {{tag, blocks.at(tag)}});
+        EXPECT_TRUE(backend.write(backend.prepareWrite(std::move(request))));
+        EXPECT_TRUE(executor->runNext());
+    };
+    write({1, 2, 3}, "full");
+    EXPECT_EQ(backend.waitForPrefix({1, 2, 3}, 0).status, "unavailable");
+    write({3}, "linear");
+    write({3}, "swa");
+    EXPECT_EQ(backend.waitForPrefix({1, 2, 3}, 0).status, "unavailable");
+    write({2}, "swa");
+    EXPECT_EQ(backend.waitForPrefix({1, 2, 3}, 0).status, "success");
+    // Failures outside the linear tail and SWA window do not poison this prefix.
+    backend.failNextWrite();
+    write({1}, "linear");
+    backend.failNextWrite();
+    write({1}, "swa");
+    EXPECT_EQ(backend.waitForPrefix({1, 2, 3}, 0).status, "success");
+    backend.failNextWrite();
+    write({2}, "full");
+    EXPECT_EQ(backend.waitForPrefix({1, 2, 3}, 0).error_code, 105);
+    backend.shutdown();
+    for (const auto& [tag, pool] : pools) {
+        pool->decRef(blocks.at(tag));
+    }
 }
 
 TEST(StorageBackendTest, AsyncWriteDuringStoppingIsRejectedAndReleasesPins) {

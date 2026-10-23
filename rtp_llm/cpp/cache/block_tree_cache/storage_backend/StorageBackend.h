@@ -17,14 +17,9 @@
 #include "rtp_llm/cpp/cache/KVCacheResource.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/block_pool/DeviceBlockPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/StorageBackendExecutor.h"
+#include "rtp_llm/cpp/cache/block_tree_cache/storage_backend/RemoteWriteLedger.h"
 
 namespace rtp_llm {
-
-struct RemoteCacheStatus {
-    std::string status{"success"};
-    int error_code{0};
-    std::string message;
-};
 
 class StorageBackendError: public std::runtime_error {
 public:
@@ -114,7 +109,11 @@ public:
     // Waits for currently admitted operations to settle. Callers must ensure
     // the relevant write was submitted first. Admission remains open.
     bool waitForIdle(int64_t timeout_ms);
+    // Historical backend diagnostic; migration must use waitForPrefix instead.
     RemoteCacheStatus waitForIdleStatus(int64_t timeout_ms);
+    // Captures the latest submitted writes for the full/linear/SWA dependencies.
+    // A timeout only ends this wait; writes continue owning their source pins.
+    RemoteCacheStatus waitForPrefix(const CacheKeysType& keys, int64_t timeout_ms);
     // Must not be called from backend I/O or completion callbacks.
     void shutdown();
 
@@ -161,6 +160,7 @@ private:
     size_t                  in_flight_{0};
     std::atomic<bool>       write_failed_{false};
     RemoteCacheStatus      write_error_;
+    RemoteWriteLedger      write_ledger_;
 
     friend class LoadAsyncContext;
 };

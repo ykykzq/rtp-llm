@@ -22,6 +22,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
 #include "rtp_llm/cpp/cache/block_tree_cache/transfer/BlockTransferRequestConverter.h"
 #include "rtp_llm/cpp/cache/KVCacheHashUtil.h"
+#include "rtp_llm/cpp/utils/HashUtil.h"
 #include "rtp_llm/cpp/cache/KVCacheMetrics.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/model_rpc/BroadcastManager.h"
@@ -657,6 +658,36 @@ RemoteCacheStatus KVCacheManager::waitRemoteCacheStatus(int64_t timeout_ms) {
 
 void KVCacheManager::setCacheKeySalt(CacheKeyType salt) {
     cache_key_salt_.store(salt, std::memory_order_relaxed);
+}
+
+RemoteCacheStatus KVCacheManager::waitRemotePrefixStatus(
+    const std::vector<int32_t>& tokens, CacheKeyType salt, int64_t timeout_ms) {
+    if (!block_tree_cache_ || !isAllocatorOwner() || (cp_slot_mapper_ && cp_slot_mapper_->isSharded())) {
+        return {"unavailable", -1, "prefix status requires the TP allocator owner and CP=1"};
+    }
+    if (salt != cache_key_salt_.load(std::memory_order_relaxed)) {
+        return {"unavailable", -1, "prefix weight/cache namespace changed"};
+    }
+    // The last sampled token has not been forwarded through the model yet.
+    // Only complete cache blocks preceding it can be reused on continuation.
+    const size_t stride = config_.seq_size_per_block;
+    if (tokens.empty() || stride == 0) {
+        return {"unavailable", -1, "prefix contains no complete reusable block"};
+    }
+    const size_t reusable_tokens = ((tokens.size() - 1) / stride) * stride;
+    CacheKeysType keys;
+    keys.reserve(reusable_tokens / stride);
+    auto hash = salt;
+    for (size_t i = 0; i < reusable_tokens; i += stride) {
+        hash = hashInt64Array(hash, tokens.data() + i, tokens.data() + i + stride);
+        keys.push_back(hash);
+    }
+    auto status = block_tree_cache_->waitRemotePrefixStatus(keys, timeout_ms);
+    status.prefix_tokens = reusable_tokens;
+    if (salt != cache_key_salt_.load(std::memory_order_relaxed)) {
+        return {"unavailable", -1, "prefix weight/cache namespace changed during wait"};
+    }
+    return status;
 }
 
 size_t KVCacheManager::availableTokensNum() const {

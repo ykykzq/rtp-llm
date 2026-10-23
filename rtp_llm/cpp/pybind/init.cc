@@ -57,6 +57,7 @@ PYBIND11_MODULE(libth_transformer, m) {
     m.def("get_build_capabilities", []() {
         py::dict capabilities;
         capabilities["remote_kv_cache"] = KVCacheManager::remoteCacheCompiled();
+        capabilities["remote_prefix_write_status"] = 1;
         return capabilities;
     });
     registerRtpLLMOp(m);

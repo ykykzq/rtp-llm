@@ -354,7 +354,25 @@ bool StorageBackend::write(StorageWriteTask task) {
     RTP_LLM_CHECK(initialized_);
     RTP_LLM_CHECK(task.state_ != nullptr);
     auto state = std::move(task.state_);
-    return dispatch([this, state](Lifecycle outcome) {
+    std::vector<RemoteWriteLedger::Key> keys;
+    for (size_t i = 0; i < state->request.keys->size(); ++i) {
+        for (const auto& handle : state->request.handles[i]) {
+            keys.emplace_back((*state->request.keys)[i], handle.tag);
+        }
+    }
+    const auto ticket = write_ledger_.begin(keys);
+    if (!ticket.admitted) {
+        {
+            std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+            if (!write_failed_.load()) {
+                write_error_ = ticket.record->result;
+            }
+            write_failed_.store(true);
+        }
+        state->finish();
+        return false;
+    }
+    return dispatch([this, state, ticket](Lifecycle outcome) {
         bool success = outcome == Lifecycle::ACCEPTING;
         RemoteCacheStatus error{"write_failed", -1, "remote cache write was rejected"};
         if (outcome == Lifecycle::ACCEPTING) {
@@ -374,12 +392,26 @@ bool StorageBackend::write(StorageWriteTask task) {
         if (!success) {
             std::lock_guard<std::mutex> lock(lifecycle_mutex_);
             if (!write_failed_.load()) {
-                write_error_ = std::move(error);
+                write_error_ = error;
             }
             write_failed_.store(true);
         }
         state->finish();
+        write_ledger_.complete(ticket, success ? RemoteCacheStatus{} : error);
     });
+}
+
+RemoteCacheStatus StorageBackend::waitForPrefix(const CacheKeysType& keys, int64_t timeout_ms) {
+    RTP_LLM_CHECK_WITH_INFO(storage_backend_detail::completing_backend != this,
+                            "prefix wait cannot run from a storage callback");
+    std::vector<RemoteWriteLedger::Key> required;
+    for (const auto& group : topology().groups()) {
+        const auto count = std::min(keys.size(), group.reuseBlockCount(keys.size()));
+        for (size_t i = keys.size() - count; i < keys.size(); ++i) {
+            required.emplace_back(keys[i], group.tag);
+        }
+    }
+    return write_ledger_.wait(write_ledger_.capture(required), timeout_ms);
 }
 
 }  // namespace rtp_llm
