@@ -671,8 +671,11 @@ RemoteCacheStatus KVCacheManager::waitRemotePrefixStatus(
     // The last sampled token has not been forwarded through the model yet.
     // Only complete cache blocks preceding it can be reused on continuation.
     const size_t stride = config_.seq_size_per_block;
-    if (tokens.empty() || stride == 0) {
-        return {"unavailable", -1, "prefix contains no complete reusable block"};
+    if (stride == 0) {
+        return {"unavailable", -1, "KV cache block size is zero"};
+    }
+    if (tokens.size() <= stride) {
+        return {"no_complete_block", 0, "prefix contains no complete reusable block; continue decoding"};
     }
     const size_t reusable_tokens = ((tokens.size() - 1) / stride) * stride;
     CacheKeysType keys;

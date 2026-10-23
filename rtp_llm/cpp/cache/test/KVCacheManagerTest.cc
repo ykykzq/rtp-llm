@@ -2168,6 +2168,34 @@ TEST_F(KVCacheManagerTest, GetKVCacheInfoReturnsAllKeysBeyondTenThousand) {
     kv_cache_manager->free(FreeInfo{resource, tokens});
 }
 
+TEST_F(KVCacheManagerTest, RemotePrefixStatusDistinguishesShortPrefixesFromUnavailableWrites) {
+    for (const size_t block_size : {4u, 1024u}) {
+        auto cache_config = makeSimpleMhaCacheConfig(
+            /*layer_num=*/1, /*block_num=*/8, block_size, rtp_llm::DataType::TYPE_INT8);
+        KVCacheConfig kv_cache_config;
+        kv_cache_config.reuse_cache = true;
+        auto manager = std::make_shared<KVCacheManager>(cache_config, /*warmup=*/false, nullptr, kv_cache_config);
+        ASSERT_TRUE(manager->init());
+        manager->setCacheKeySalt(7);
+
+        for (const size_t length : {size_t{0}, size_t{1}, block_size - 1, block_size}) {
+            const auto status = manager->waitRemotePrefixStatus(std::vector<int32_t>(length, 1), 7, 1);
+            EXPECT_EQ(status.status, "no_complete_block") << "prefix=" << length << " block=" << block_size;
+            EXPECT_EQ(status.error_code, 0);
+            EXPECT_EQ(status.prefix_tokens, 0u);
+            EXPECT_TRUE(status.write_ids.empty());
+        }
+        for (const size_t length : {block_size + 1, 2 * block_size, 2 * block_size + 1}) {
+            const auto status = manager->waitRemotePrefixStatus(std::vector<int32_t>(length, 1), 7, 1);
+            // Full blocks still need real remote writes; this manager has no remote backend.
+            EXPECT_EQ(status.status, "unavailable");
+            EXPECT_EQ(status.prefix_tokens, ((length - 1) / block_size) * block_size);
+            EXPECT_TRUE(status.write_ids.empty());
+        }
+        EXPECT_EQ(manager->waitRemotePrefixStatus({1}, 8, 1).status, "unavailable");
+    }
+}
+
 TEST_F(KVCacheManagerTest, StorePublishesFullBlocksOnlyAndLookupLeavesOneToken) {
     auto cache_config = makeSimpleMhaCacheConfig(
         /*layer_num=*/1, /*block_num=*/8, /*tokens_per_block=*/4, rtp_llm::DataType::TYPE_INT8);
