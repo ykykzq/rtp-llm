@@ -1,4 +1,5 @@
 #include <torch/library.h>
+#include <curl/curl.h>
 #include "rtp_llm/cpp/config/ModelConfig.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -16,6 +17,13 @@ void registerExecCtxOps(pybind11::module& m);
 using namespace torch_ext;
 
 PYBIND11_MODULE(librtp_compute_ops, m) {
+    m.def("get_curl_build_info", []() {
+        const auto* info = curl_version_info(CURLVERSION_NOW);
+        py::dict result;
+        result["version"] = info->version;
+        result["async_dns"] = (info->features & CURL_VERSION_ASYNCHDNS) != 0;
+        return result;
+    });
 #if USING_CUDA || USING_ROCM
     registerExecCtxOps(m);
 #endif

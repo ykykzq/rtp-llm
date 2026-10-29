@@ -103,6 +103,7 @@ cc_library(
     ],
     hdrs = [],
     deps = [
+        "@curl//:curl",
         "//rtp_llm/cpp/cache:batch_kv_cache_resource",
         "//rtp_llm/cpp/cache:block_info",
         "//rtp_llm/cpp/cache:cache_config",
