@@ -16,6 +16,29 @@
 | **MMHA**              | ✅                | ❌                 | ❌      | ❌                 | NV ✅<br> AMD ✅        | None                            | PREFILL ❌ <br>  DECODE✅  |
 | **AiterPA**           | ✅                | ❌                 | ❌      | ❌                 | NV ❌<br> AMD ✅        | None                            | PREFILL ❌ <br>  DECODE✅  |
 
+## SM100 native XQA and TRT-LLM Gen selection
+
+The bundled native `XQAImpl` dispatches kernels compiled for `sm_90a` and is
+eligible only on SM90. A newer compute capability is not compatible with those
+architecture-specific kernels. Python selection, native `support()`, and the
+native launch path all enforce this constraint. The separate FlashInfer JIT
+`XQADecodeImpl` retains its own SM90/SM10x eligibility checks.
+
+TRT-LLM Gen is enabled by default and handles SM100 prefill and decode. For
+Qwen2.5-32B with TP4, the per-rank layout is Q10/KV2, head dimension 128, BF16,
+and page size 16. When inheriting a configuration that disables TRT-LLM Gen,
+set `ENABLE_FLASHINFER_TRTLLM_GEN=True` (or
+`--enable_flashinfer_trtllm_gen True`). In Ray deployments, propagate the setting
+to both the driver and worker runtime environments. `ENABLE_XQA=False` can also
+be used to disable both XQA implementations.
+
+The factory preserves explicit backend disables. If no enabled implementation
+supports the SM10x configuration, it reports the shape and TRT-LLM Gen setting
+with the configuration remedy. It does not silently re-enable a disabled backend.
+The CPU `sm100_attention_selection_test` covers the routing/disable matrix;
+`trtllm_gen_test.FlashInferPythonMHATest.test_qwen25_tp4_sm100_page16_bf16`
+covers native XQA rejection and numerical TRT-LLM Gen prefill/decode on SM100.
+
 ## ROCm KV-cache V layout and PA flag combinations
 
 The matrix uses `[prefill writer:layout] (decode reader:layout)`, where `V` is vectorized and `L` is

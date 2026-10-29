@@ -199,6 +199,55 @@ The capability test now also runs a fresh child interpreter with and without
 an explicit second `import libth_transformer`, checking its process exit status
 for the reported shutdown failure.
 
+## Native Crash Evidence and Concurrent Reads
+
+The Qwen2.5-32B checkpoint-5 restore on 2026-10-25 loaded all trainer state,
+then failed before update 6 with `longjmp causes uninitialized stack frame`.
+The unknown native frame is not yet symbolized. The SDK contains curl alarm
+resolver symbols, but this alone does not identify the failing call site.
+`KVCMPublisher` already sets `CURLOPT_NOSIGNAL`; the SDK's embedded curl is a
+separate audit target. See [libcurl's thread-safety contract](https://curl.se/libcurl/c/threadsafe.html).
+Do not disable fortify, mask SIGABRT, or treat a new cache salt as a repair.
+
+Set `RTP_LLM_NATIVE_DIAGNOSTICS_DIR` to a writable **node-local** directory in
+the driver environment before launching VERL. VERL forwards it to every RTP
+rank. On native engine load and after engine startup, the process saves its
+own `/proc/self/maps`, PID, host, process stat record, and ELF Build IDs for
+RTP/KVCM/Mooncake/curl/libc libraries. Install `readelf` from binutils for Build
+IDs; missing tools or permissions are recorded without stopping the engine.
+The helper checks mapped inode/device against the file before reading its
+identity and never overwrites previous captures. It runs outside signal
+handlers and records no environment variables or SDK configuration.
+
+Collect each crashed PID's capture, stack/core, and exact installed binaries
+from that same run. Earlier-process maps are invalid for ASLR symbolization.
+Startup maps cannot identify libraries loaded or replaced later; use a core
+or a matching later map when the address is absent. No native crash repair is
+claimed by adding this evidence collection.
+
+On two idle GPU nodes, the stress test runs 12 independent native GPU clients
+(six per node), with every rank reading a peer on the other node. It recreates
+reader clients and verifies bytes for 64 KiB and 64 MiB buffers repeatedly.
+The writers retain registered buffers until all reads finish; uncertain
+completion kills the actors without releasing buffers first.
+
+```bash
+export RTP_LLM_NATIVE_DIAGNOSTICS_DIR=/home/admin/rl-validation/native-diagnostics
+RTP_RUN_NATIVE_KV_TEST=1 RTP_RUN_NATIVE_KV_STRESS=1 \
+RTP_NATIVE_KV_WORKERS_PER_NODE=6 RTP_NATIVE_KV_READ_REPEATS=20 \
+python -m pytest --import-mode=importlib --confcutdir=rtp_llm/test/smoke \
+  rtp_llm/test/smoke/test_native_kv_probe_cluster.py \
+  -k concurrent -q -s
+```
+
+Keep `RAY_ADDRESS`, `KVCM_SERVER_ADDRESS`, `KVCM_INSTANCE_GROUP`,
+`KVCM_SDK_CONFIG`, and `MASTER_METRICS` aligned with the deployment. This probes
+the actual SDK data path by URI; it does not exercise RTP's `GetReplicaList`,
+TP execution, or trajectory migration. Passing it must be followed by strict
+checkpoint-5 restore and updates 6-10, including real parameter deltas,
+installed-weight checks, final evaluation, checkpoint 10, and step-7 traces.
+These hardware checks have not run on the macOS development host.
+
 ## Linux x86_64 recipe
 
 Use the repository's CUDA 13.2 / Python 3.10 build environment with the matching

@@ -69,23 +69,21 @@ class TestXQAAttnOp(BaseAttentionTest):
 
         if not is_supported:
             # This target exists to check XQA correctness and is pinned to H20 for
-            # that reason, so on sm90+ support() returning False is the bug, not a
+            # that reason, so on sm90 support() returning False is the bug, not a
             # reason to opt out -- skipping there would turn a broken backend into
             # a green run. Only a genuinely unsuitable device is a skip.
             major, minor = torch.cuda.get_device_capability()
             sm = major * 10 + minor
-            self.assertLess(
+            self.assertNotEqual(
                 sm,
                 90,
                 f"XQAAttnOp.support() returned False on sm{sm}, but XQA is "
-                f"compiled for sm_90a and XQAAttnOp::support only requires "
-                f"get_sm() >= 90 -- on this device it should be supported. "
+                f"compiled for sm_90a -- on this device it should be supported. "
                 f"Treating this as a failure rather than a skip, because this "
                 f"target is dedicated to XQA correctness.",
             )
             self.skipTest(
-                f"XQA is compiled for sm_90a only and XQAAttnOp::support requires "
-                f"get_sm() >= 90; this device is sm{sm}. Skipping instead of "
+                f"XQA is compiled for sm_90a only; this device is sm{sm}. Skipping instead of "
                 f"returning so the missing coverage cannot masquerade as a pass."
             )
 
@@ -349,6 +347,20 @@ class TestXQAAttnOp(BaseAttentionTest):
             )
 
         logging.info("\n=== XQAAttnOp support() testing completed ===")
+
+    def test_qwen25_tp4_support_matches_bundled_architecture(self):
+        config = self._create_config(
+            head_num=10,
+            head_num_kv=2,
+            size_per_head=128,
+            seq_size_per_block=16,
+            data_type="bf16",
+        )
+        inputs = self._create_attention_inputs(1, [17], 16)
+        self.assertEqual(
+            XQAAttnOp(config.attn_configs).support(inputs),
+            torch.cuda.get_device_capability() == (9, 0),
+        )
 
     def test_support_functionality(self):
         """Test XQAAttnOp support function with various configurations"""

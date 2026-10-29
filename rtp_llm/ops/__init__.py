@@ -363,6 +363,9 @@ def _load_engine_ops(required: bool = False) -> None:
             globals()["RtpEmbeddingOp"] = RtpEmbeddingOp
             globals()["RtpLLMOp"] = RtpLLMOp
             _engine_ops_error = None
+            from rtp_llm.utils.native_diagnostics import capture_native_diagnostics
+
+            capture_native_diagnostics("engine_ops_loaded")
         except BaseException as e:
             _engine_ops_error = e
             _set_engine_fallbacks()

@@ -50,13 +50,12 @@ void updateKvCacheOffsetTensor(const torch::Tensor& kv_cache_offset, const torch
 XQAAttnOp::XQAAttnOp(const AttentionConfigs& attn_configs): attn_configs_(attn_configs) {}
 
 bool XQAAttnOp::support(torch_ext::PyAttentionInputs attn_inputs) {
-    return get_sm() >= 90
-           && supportXqa(DataType::TYPE_BF16,
-                         DataType::TYPE_BF16,
-                         DataType::TYPE_FP8_E4M3,
-                         attn_configs_.head_num / attn_configs_.kv_head_num,
-                         attn_configs_.size_per_head,
-                         attn_configs_.kernel_tokens_per_block);
+    return supportXqa(DataType::TYPE_BF16,
+                      DataType::TYPE_BF16,
+                      DataType::TYPE_FP8_E4M3,
+                      attn_configs_.head_num / attn_configs_.kv_head_num,
+                      attn_configs_.size_per_head,
+                      attn_configs_.kernel_tokens_per_block);
 }
 
 ParamsBasePtr XQAAttnOp::prepare(torch_ext::PyAttentionInputs attn_inputs) {

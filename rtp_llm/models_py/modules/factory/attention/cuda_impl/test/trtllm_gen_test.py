@@ -30,7 +30,7 @@ from rtp_llm.test.utils.numeric_util import assert_close_with_mismatch_tolerance
 device = torch.device("cuda")
 
 from rtp_llm.ops import AttentionConfigs, KvCacheDataType
-from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs
+from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, XQAAttnOp
 
 
 class FlashInferTRTLLMDecodeImplReplayTest(TestCase):
@@ -311,6 +311,27 @@ class FlashInferPythonMHATest(TestCase):
             is_prefill=False,
             use_prefill_op=False,
         )
+
+    def test_qwen25_tp4_sm100_page16_bf16(self):
+        if not is_sm10x():
+            raise SkipTest("Qwen2.5 TP4 fallback regression requires SM100")
+        self.num_heads = 10
+        self.num_kv_heads = 2
+        self.head_dim = 128
+        self.page_size = 16
+        config = self._create_config(torch.bfloat16)
+        inputs = gen_attention_inputs(
+            self.page_size, self.num_pages, sequence_lengths=[15, 16, 17, 129]
+        )
+        self.assertFalse(XQAAttnOp(config).support(inputs))
+        for is_prefill in (True, False):
+            with self.subTest(is_prefill=is_prefill):
+                self._test_flashinfer_trtllm_base(
+                    torch.bfloat16,
+                    [15, 16, 17, 129],
+                    is_prefill=is_prefill,
+                    use_prefill_op=is_prefill,
+                )
 
 
 class PrepareCudaGraphKernelTest(TestCase):

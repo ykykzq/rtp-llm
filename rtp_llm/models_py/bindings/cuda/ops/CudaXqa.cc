@@ -2,6 +2,7 @@
 #include "3rdparty/xqa/mha.h"
 #include "rtp_llm/models_py/bindings/cuda/cuda_host_utils.h"
 #include "rtp_llm/cpp/utils/math_utils.h"
+#include <ATen/cuda/CUDAContext.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -11,14 +12,12 @@ using namespace rtp_llm;
 namespace rtp_llm {
 
 static const cudaDeviceProp& getDeviceProp() {
-    static cudaDeviceProp prop = []() {
-        int device_id;
-        check_cuda_value(cudaGetDevice(&device_id));
-        cudaDeviceProp device_prop;
-        check_cuda_value(cudaGetDeviceProperties(&device_prop, device_id));
-        return device_prop;
-    }();
-    return prop;
+    return *at::cuda::getCurrentDeviceProperties();
+}
+
+static bool supportXqaArchitecture(const cudaDeviceProp& prop) {
+    // 3rdparty/xqa builds architecture-specific sm_90a kernels only.
+    return prop.major == 9 && prop.minor == 0;
 }
 
 static cudaStream_t getCurrentStream() {
@@ -98,7 +97,9 @@ bool supportXqa(DataType input_type,
                 size_t   group_size,
                 size_t   head_dim,
                 size_t   page_size) {
-    bool support = (input_type == DataType::TYPE_BF16 || input_type == DataType::TYPE_FP16)
+    const auto& device_prop = getDeviceProp();
+    bool support = supportXqaArchitecture(device_prop)
+                   && (input_type == DataType::TYPE_BF16 || input_type == DataType::TYPE_FP16)
                    && (output_type == DataType::TYPE_BF16 || output_type == DataType::TYPE_FP16
                        || output_type == DataType::TYPE_FP8_E4M3)
                    && (kv_cache_type == DataType::TYPE_BF16 || kv_cache_type == DataType::TYPE_FP16
@@ -108,7 +109,9 @@ bool supportXqa(DataType input_type,
     if (!support) {
         std::call_once(xqa_info_flag, [&]() {
             RTP_LLM_LOG_WARNING(
-                "xqa not supported, in_type:%d out_type:%d kv_cache_type:%d, group_size:%d head_dim:%d page_size:%d",
+                "xqa not supported (requires sm_90a), sm:%d, in_type:%d out_type:%d kv_cache_type:%d, "
+                "group_size:%d head_dim:%d page_size:%d",
+                device_prop.major * 10 + device_prop.minor,
                 int(input_type),
                 int(output_type),
                 int(kv_cache_type),
@@ -141,6 +144,10 @@ void runXqa(void*     input,
             size_t    max_batch_size,
             float     q_scale,
             uint32_t  beam_width) {
+    const auto& device_prop = getDeviceProp();
+    RTP_LLM_CHECK_WITH_INFO(supportXqaArchitecture(device_prop),
+                            "XQA requires the bundled sm_90a kernels; current device is sm%d",
+                            device_prop.major * 10 + device_prop.minor);
     if (!input || !output || !head_num || !kv_head_num || (head_num / kv_head_num > 16)
         || (head_dim != 64 && head_dim != 128 && head_dim != 256) || !batch_size || batch_size > max_batch_size
         || !max_blocks_per_seq || !max_seq_len
@@ -188,8 +195,6 @@ void runXqa(void*     input,
     static void* scratch = getScratch(group_size, beam_width);
 
     static torch::Tensor q_mask = getSpecQMask(max_q_len, max_batch_size);
-
-    static auto device_prop = getDeviceProp();
 
     SpecDecParams spec_params{
         static_cast<uint32_t>(max_q_len), reinterpret_cast<uint32_t*>(q_cu_seqlens), q_mask.data_ptr<uint32_t>()};

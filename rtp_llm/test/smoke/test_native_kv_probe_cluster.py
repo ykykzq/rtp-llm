@@ -94,6 +94,123 @@ class GPUProbeWorker:
                 self.buffer = None
 
 
+class ConcurrentGPUProbeWorker:
+    def __init__(self, address, group, sdk):
+        self.writer = GPUProbeWorker(address, group, sdk)
+        self.reader = GPUProbeWorker(address, group, sdk)
+
+    def put(self, ticket):
+        return self.writer.put(ticket)
+
+    def read_repeatedly(self, ticket, repeats):
+        results = []
+        for _ in range(repeats):
+            # Recreate the SDK client to exercise both initialization and reads.
+            results.append(self.reader.get(ticket))
+            self.reader.close()
+        return results
+
+    def close(self):
+        self.writer.close()
+
+
+@pytest.mark.skipif(
+    os.environ.get("RTP_RUN_NATIVE_KV_STRESS") != "1",
+    reason="opt-in concurrent native SDK stress test; requires idle GPUs",
+)
+def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    per_node = int(os.environ.get("RTP_NATIVE_KV_WORKERS_PER_NODE", "6"))
+    repeats = int(os.environ.get("RTP_NATIVE_KV_READ_REPEATS", "20"))
+    timeout = int(os.environ.get("RTP_NATIVE_KV_TIMEOUT_S", "600"))
+    assert per_node > 0 and repeats > 0
+    connected_here = not ray.is_initialized()
+    workers = []
+    try:
+        if connected_here:
+            ray.init(address=os.environ.get("RAY_ADDRESS", "auto"))
+        nodes = [
+            node
+            for node in ray.nodes()
+            if node["Alive"] and node["Resources"].get("GPU", 0) >= per_node
+        ]
+        assert len(nodes) >= 2, "Concurrent KV acceptance requires two GPU nodes"
+        assert nodes[0]["NodeManagerAddress"] != nodes[1]["NodeManagerAddress"]
+        env = {
+            key: os.environ[key]
+            for key in ("MASTER_METRICS", "RTP_LLM_NATIVE_DIAGNOSTICS_DIR")
+            if key in os.environ
+        }
+        actor = ray.remote(num_gpus=1, num_cpus=1, max_restarts=0)(
+            ConcurrentGPUProbeWorker
+        )
+        for node in nodes[:2]:
+            for _ in range(per_node):
+                workers.append(
+                    actor.options(
+                        scheduling_strategy=NodeAffinitySchedulingStrategy(
+                            node["NodeID"], soft=False
+                        ),
+                        runtime_env={"env_vars": env},
+                    ).remote(
+                        os.environ["KVCM_SERVER_ADDRESS"],
+                        os.environ["KVCM_INSTANCE_GROUP"],
+                        os.environ.get("KVCM_SDK_CONFIG", '[{"type":"mooncake"}]'),
+                    )
+                )
+        for size in (65536, 64 << 20):
+            tickets = ray.get(
+                [
+                    worker.put.remote(
+                        {
+                            "instance_id": "rtp-probe-" + uuid.uuid4().hex,
+                            "key": uuid.uuid4().int & ((1 << 63) - 1),
+                            "size": size,
+                        }
+                    )
+                    for worker in workers
+                ],
+                timeout=timeout,
+            )
+            # Pair every reader with a writer on the other node. All writers
+            # retain registered GPU buffers until every reader has completed.
+            results = ray.get(
+                [
+                    worker.read_repeatedly.remote(
+                        tickets[(index + per_node) % len(workers)], repeats
+                    )
+                    for index, worker in enumerate(workers)
+                ],
+                timeout=timeout,
+            )
+            for index, reads in enumerate(results):
+                producer = tickets[(index + per_node) % len(workers)]
+                assert len(reads) == repeats
+                assert all(result["verified_bytes"] == size for result in reads)
+                assert all(
+                    result["consumer_build"] == producer["producer_build"]
+                    for result in reads
+                )
+                assert len({result["sha256"] for result in reads}) == 1
+            print(
+                json.dumps(
+                    {
+                        "ranks": len(workers),
+                        "reads_per_rank": repeats,
+                        "bytes_per_read": size,
+                    }
+                )
+            )
+            ray.get([worker.close.remote() for worker in workers], timeout=timeout)
+    finally:
+        for worker in workers:
+            ray.kill(worker, no_restart=True)
+        if connected_here:
+            ray.shutdown()
+
+
 def test_native_gpu_put_get_on_distinct_nodes():
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy

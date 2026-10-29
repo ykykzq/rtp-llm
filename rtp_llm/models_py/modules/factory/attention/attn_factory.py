@@ -314,6 +314,25 @@ def get_fmha_impl(
             "no generation-prefill CUDA Graph attention implementation "
             "matches the current model, cache layout, dtype, and GPU"
         )
+    if get_device_type() == DeviceType.Cuda:
+        from rtp_llm.models_py.utils.arch import is_sm10x
+
+        if is_sm10x():
+            trtllm_enabled = (
+                fmha_config is None or fmha_config.enable_flashinfer_trtllm_gen
+            )
+            raise RuntimeError(
+                "No enabled attention backend supports this SM10x configuration "
+                f"(prefill={attn_inputs.is_prefill}, Q={attn_configs.head_num}, "
+                f"KV={attn_configs.kv_head_num}, head_dim={attn_configs.size_per_head}, "
+                f"page_size={attn_configs.kernel_tokens_per_block}, "
+                f"enable_flashinfer_trtllm_gen={trtllm_enabled}). "
+                "Bundled native XQA requires sm_90a. Enable TRT-LLM Gen with "
+                "ENABLE_FLASHINFER_TRTLLM_GEN=True in the driver and worker "
+                "environments, or --enable_flashinfer_trtllm_gen True; "
+                "if already enabled, check the backend initialization warnings. "
+                "Explicit backend disables are preserved."
+            )
     raise Exception("can not find mha type")
 
 
