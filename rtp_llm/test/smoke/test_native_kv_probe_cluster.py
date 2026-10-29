@@ -13,6 +13,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _worker_runtime_env():
+    return {
+        "env_vars": {
+            key: os.environ[key]
+            for key in (
+                "LD_PRELOAD",
+                "JE_ARROW_MALLOC_CONF",
+                "LD_LIBRARY_PATH",
+                "MASTER_METRICS",
+                "MC_GID_INDEX",
+                "PYTHONPATH",
+                "RTP_LLM_NATIVE_DIAGNOSTICS_DIR",
+            )
+            if key in os.environ
+        }
+    }
+
+
 class GPUProbeWorker:
     def __init__(self, address, group, sdk):
         import torch
@@ -69,9 +87,12 @@ class GPUProbeWorker:
         }
 
     def get(self, ticket):
+        self.open(ticket, False)
+        return self.read(ticket)
+
+    def read(self, ticket):
         import torch
 
-        self.open(ticket, False)
         self.probe.get(ticket["uri"])
         torch.cuda.synchronize()
         actual = self.buffer.cpu()
@@ -96,19 +117,57 @@ class GPUProbeWorker:
 
 class ConcurrentGPUProbeWorker:
     def __init__(self, address, group, sdk):
+        self.arguments = address, group, sdk
         self.writer = GPUProbeWorker(address, group, sdk)
         self.reader = GPUProbeWorker(address, group, sdk)
+        self.threaded_readers = []
 
     def put(self, ticket):
         return self.writer.put(ticket)
 
-    def read_repeatedly(self, ticket, repeats):
+    def read_repeatedly(self, ticket, repeats, threads=1):
+        if threads > 1:
+            return self.read_threaded(ticket, repeats, threads)
         results = []
         for _ in range(repeats):
             # Recreate the SDK client to exercise both initialization and reads.
             results.append(self.reader.get(ticket))
             self.reader.close()
         return results
+
+    def read_threaded(self, ticket, repeats, threads):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+
+        import torch
+
+        assert not self.threaded_readers
+        # Actor-owned references keep registered buffers alive on any failure.
+        # The driver kills the actor if an SDK call's completion is uncertain.
+        self.threaded_readers = [
+            GPUProbeWorker(*self.arguments) for _ in range(threads)
+        ]
+        for reader in self.threaded_readers:
+            reader.open(ticket, False)
+        start = Barrier(threads)
+
+        def read(reader):
+            torch.cuda.set_device(0)
+            start.wait()
+            results = []
+            for _ in range(repeats):
+                reader.buffer.zero_()
+                torch.cuda.synchronize()
+                results.append(reader.read(ticket))
+            return results
+
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            results = list(pool.map(read, self.threaded_readers))
+        # Close only after every thread completed and verified all its reads.
+        for reader in self.threaded_readers:
+            reader.close()
+        self.threaded_readers = []
+        return [result for reads in results for result in reads]
 
     def close(self):
         self.writer.close()
@@ -124,8 +183,9 @@ def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
 
     per_node = int(os.environ.get("RTP_NATIVE_KV_WORKERS_PER_NODE", "6"))
     repeats = int(os.environ.get("RTP_NATIVE_KV_READ_REPEATS", "20"))
+    threads = int(os.environ.get("RTP_NATIVE_KV_READER_THREADS", "1"))
     timeout = int(os.environ.get("RTP_NATIVE_KV_TIMEOUT_S", "600"))
-    assert per_node > 0 and repeats > 0
+    assert per_node > 0 and repeats > 0 and threads > 0 and timeout > 0
     connected_here = not ray.is_initialized()
     workers = []
     try:
@@ -138,11 +198,7 @@ def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
         ]
         assert len(nodes) >= 2, "Concurrent KV acceptance requires two GPU nodes"
         assert nodes[0]["NodeManagerAddress"] != nodes[1]["NodeManagerAddress"]
-        env = {
-            key: os.environ[key]
-            for key in ("MASTER_METRICS", "RTP_LLM_NATIVE_DIAGNOSTICS_DIR")
-            if key in os.environ
-        }
+        runtime_env = _worker_runtime_env()
         actor = ray.remote(num_gpus=1, num_cpus=1, max_restarts=0)(
             ConcurrentGPUProbeWorker
         )
@@ -153,7 +209,7 @@ def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
                         scheduling_strategy=NodeAffinitySchedulingStrategy(
                             node["NodeID"], soft=False
                         ),
-                        runtime_env={"env_vars": env},
+                        runtime_env=runtime_env,
                     ).remote(
                         os.environ["KVCM_SERVER_ADDRESS"],
                         os.environ["KVCM_INSTANCE_GROUP"],
@@ -179,7 +235,7 @@ def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
             results = ray.get(
                 [
                     worker.read_repeatedly.remote(
-                        tickets[(index + per_node) % len(workers)], repeats
+                        tickets[(index + per_node) % len(workers)], repeats, threads
                     )
                     for index, worker in enumerate(workers)
                 ],
@@ -187,7 +243,7 @@ def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
             )
             for index, reads in enumerate(results):
                 producer = tickets[(index + per_node) % len(workers)]
-                assert len(reads) == repeats
+                assert len(reads) == repeats * threads
                 assert all(result["verified_bytes"] == size for result in reads)
                 assert all(
                     result["consumer_build"] == producer["producer_build"]
@@ -198,13 +254,16 @@ def test_concurrent_native_gpu_reads_on_all_rollout_ranks():
                 json.dumps(
                     {
                         "ranks": len(workers),
-                        "reads_per_rank": repeats,
+                        "reader_threads_per_rank": threads,
+                        "reads_per_thread": repeats,
+                        "reads_per_rank": repeats * threads,
                         "bytes_per_read": size,
                     }
                 )
             )
             ray.get([worker.close.remote() for worker in workers], timeout=timeout)
     finally:
+        # Do not close or release registered buffers after a native/Ray timeout.
         for worker in workers:
             ray.kill(worker, no_restart=True)
         if connected_here:
@@ -231,12 +290,14 @@ def test_native_gpu_put_get_on_distinct_nodes():
             "Nodes must be on distinct hosts"
         )
         actor = ray.remote(num_gpus=1, num_cpus=1, max_restarts=0)(GPUProbeWorker)
+        runtime_env = _worker_runtime_env()
         for node in nodes[:2]:
             workers.append(
                 actor.options(
                     scheduling_strategy=NodeAffinitySchedulingStrategy(
                         node["NodeID"], soft=False
-                    )
+                    ),
+                    runtime_env=runtime_env,
                 ).remote(
                     os.environ["KVCM_SERVER_ADDRESS"],
                     os.environ["KVCM_INSTANCE_GROUP"],

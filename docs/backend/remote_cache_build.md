@@ -225,14 +225,15 @@ Startup maps cannot identify libraries loaded or replaced later; use a core
 or a matching later map when the address is absent. No native crash repair is
 claimed by adding this evidence collection.
 
-On two idle GPU nodes, the stress test runs 12 independent native GPU clients
-(six per node), with every rank reading a peer on the other node. It recreates
-reader clients and verifies bytes for 64 KiB and 64 MiB buffers repeatedly.
-The writers retain registered buffers until all reads finish; uncertain
-completion kills the actors without releasing buffers first.
+On two idle GPU nodes, the default stress test runs 12 actors (six per node),
+with every rank reading a peer on the other node. With
+`RTP_NATIVE_KV_READER_THREADS=1` (the default), it recreates reader clients
+and verifies bytes for 64 KiB and 64 MiB buffers repeatedly. The writers retain
+registered buffers until all reads finish; uncertain completion kills the
+actors without releasing buffers first.
 
 ```bash
-export RTP_LLM_NATIVE_DIAGNOSTICS_DIR=/home/admin/rl-validation/native-diagnostics
+export RTP_LLM_NATIVE_DIAGNOSTICS_DIR="$PWD/native-diagnostics"
 RTP_RUN_NATIVE_KV_TEST=1 RTP_RUN_NATIVE_KV_STRESS=1 \
 RTP_NATIVE_KV_WORKERS_PER_NODE=6 RTP_NATIVE_KV_READ_REPEATS=20 \
 python -m pytest --import-mode=importlib --confcutdir=rtp_llm/test/smoke \
@@ -240,10 +241,37 @@ python -m pytest --import-mode=importlib --confcutdir=rtp_llm/test/smoke \
   -k concurrent -q -s
 ```
 
+Set `RTP_NATIVE_KV_READER_THREADS` above one to exercise concurrent SDK reads
+inside each actor process. Each thread owns a separate native client and GPU
+buffer, which it clears before each read and verifies afterward. The following
+configuration uses four GPUs across two nodes and performs 320 buffer verifications
+across both payload sizes. It covers same-process SDK resolver races that the
+default process-only stress does not exercise:
+
+```bash
+RTP_RUN_NATIVE_KV_TEST=1 RTP_RUN_NATIVE_KV_STRESS=1 \
+RTP_NATIVE_KV_WORKERS_PER_NODE=2 RTP_NATIVE_KV_READER_THREADS=4 \
+RTP_NATIVE_KV_READ_REPEATS=10 \
+python -m pytest --import-mode=importlib --confcutdir=rtp_llm/test/smoke \
+  rtp_llm/test/smoke/test_native_kv_probe_cluster.py \
+  -k concurrent -q -s
+```
+
+CPU checks for thread ownership and failure cleanup require neither Ray nor CUDA:
+
+```bash
+python -m pytest tests/test_native_kv_probe_threading.py -q
+```
+
 Keep `RAY_ADDRESS`, `KVCM_SERVER_ADDRESS`, `KVCM_INSTANCE_GROUP`,
-`KVCM_SDK_CONFIG`, and `MASTER_METRICS` aligned with the deployment. This probes
-the actual SDK data path by URI; it does not exercise RTP's `GetReplicaList`,
-TP execution, or trajectory migration. Passing it must be followed by strict
+`KVCM_SDK_CONFIG`, and `MASTER_METRICS` aligned with the deployment. Both
+cluster tests explicitly forward launch-environment `LD_PRELOAD`,
+`JE_ARROW_MALLOC_CONF`, `LD_LIBRARY_PATH`, `MASTER_METRICS`, `MC_GID_INDEX`,
+`PYTHONPATH`, and `RTP_LLM_NATIVE_DIAGNOSTICS_DIR` to the Ray actors when set.
+Use preload libraries validated for the target image and present on both nodes;
+the tests do not choose a curl library or allocator workaround automatically.
+This probes the actual SDK data path by URI; it does not exercise RTP's
+`GetReplicaList`, TP execution, or trajectory migration. Passing it must be followed by strict
 checkpoint-5 restore and updates 6-10, including real parameter deltas,
 installed-weight checks, final evaluation, checkpoint 10, and step-7 traces.
 These hardware checks have not run on the macOS development host.

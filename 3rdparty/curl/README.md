@@ -13,9 +13,14 @@ existing publisher's `CURLOPT_NOSIGNAL=1` remains useful but was already present
 in the failing build.
 
 The static curl target compiles with hidden visibility. `CURL_STATICLIB` makes
-curl 7.60's public declarations honor that visibility as well. This prevents
-RTP's curl functions and data from resolving against the SDK/system curl, or
-being used to resolve their references. It does not hide unrelated RTP exports.
+curl 7.60's public declarations honor that visibility as well. `alwayslink = True`
+also forces the private archive into the final link: an SDK DSO earlier on the
+link command can otherwise satisfy the curl references before the linker reaches
+the archive. Hidden visibility alone did not prevent this; the affected wheel's
+`libth_transformer.so` retained 18 undefined `curl_*` symbols. Together these
+settings keep RTP's curl functions and data from resolving against the SDK/system
+curl, or being used to resolve their references. They do not hide unrelated RTP
+exports.
 
 ## Native regression and wheel acceptance
 
@@ -26,6 +31,7 @@ toolchain overrides:
 bazel test --config=cuda13_remote_cache \
   //3rdparty/curl:resolver_test \
   //3rdparty/curl:symbol_isolation_test \
+  //3rdparty/curl:sdk_linked_symbol_isolation_test \
   //rtp_llm/cpp/pybind:build_capabilities_test
 ```
 
@@ -37,6 +43,11 @@ keeps fortify enabled and has an independent deadline.
 
 `symbol_isolation_test` checks the linked ELF's public and private curl symbols
 and exercises both load orders with a conflicting global curl implementation.
+`sdk_linked_symbol_isolation_test` applies the same checks to a probe linked with
+the conflicting SDK DSO before the private curl archive. A separate SDK marker
+keeps the DSO in `DT_NEEDED`, covering archive extraction as well as runtime
+interposition. Both tests require no public or undefined `curl_*` / `Curl_*`
+symbols and require the private implementation to report asynchronous DNS.
 `build_capabilities_test` checks the actual RTP modules, queries the compute
 library's runtime `CURL_VERSION_ASYNCHDNS`, and retains the fresh-process import
 and exit checks. After building and installing the wheel on **both** nodes:
@@ -44,6 +55,12 @@ and exit checks. After building and installing the wheel on **both** nodes:
 ```bash
 EXPECT_REMOTE_KV_CACHE=true python rtp_llm/cpp/pybind/build_capabilities_test.py
 ```
+
+The 2026-10-29 Linux validation handoff recorded the SDK-linked regression failing
+before `alwayslink`, then all three curl tests passing after it. The rebuilt
+wheel's three capability/isolation tests passed on both validation nodes. Those
+are handed-off results, not a new Linux build performed during local integration;
+macOS native checks cannot substitute for the Bazel/ELF and installed-wheel checks.
 
 The native resolver regression is a focused transport test, not proof of TP4
 KV migration or resumed RL. Preserve the existing checkpoint 5, use a new output

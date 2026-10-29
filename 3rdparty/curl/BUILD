@@ -30,3 +30,28 @@ cc_binary(
     srcs = ["conflicting_curl.cc"],
     linkshared = True,
 )
+
+cc_import(
+    name = "conflicting_sdk",
+    testonly = True,
+    shared_library = ":conflicting_curl.so",
+)
+
+cc_binary(
+    name = "curl_sdk_linked_probe.so",
+    testonly = True,
+    srcs = ["sdk_linked_probe.cc"],
+    linkshared = True,
+    deps = [":conflicting_sdk", "@curl//:curl"],
+)
+
+py_test(
+    name = "sdk_linked_symbol_isolation_test",
+    srcs = ["symbol_isolation_test.py"],
+    main = "symbol_isolation_test.py",
+    args = [
+        "$(location :curl_sdk_linked_probe.so)",
+        "$(location :conflicting_curl.so)",
+    ],
+    data = [":curl_sdk_linked_probe.so", ":conflicting_curl.so"],
+)

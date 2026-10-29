@@ -269,6 +269,9 @@ cc_library(
     defines = ["CURL_STATICLIB"],
     includes = ["include"],
     linkstatic = True,
+    # A previously linked SDK can satisfy curl references before this archive.
+    # Include the private implementation even when the SDK exports the same API.
+    alwayslink = True,
     linkopts = [
         "-lrt",
         "-pthread",
